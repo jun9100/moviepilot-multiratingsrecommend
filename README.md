@@ -33,7 +33,7 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 2. 安装插件 `MultiRatingsRecommend`。
 3. 在插件配置页启用插件，并按需填写 `OMDb API Key` 以启用 IMDb 评分。
 
-> 当前文档对应版本：`v0.4.0`
+> 当前文档对应版本：`v0.4.1`
 
 ## 配置项
 

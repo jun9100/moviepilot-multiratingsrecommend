@@ -25,7 +25,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.4.0"
+    plugin_version = "0.4.1"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -141,6 +141,10 @@ class MultiRatingsRecommend(_PluginBase):
     def init_plugin(self, config: dict = None):
         conf = self._default_config()
         conf.update(config or {})
+        if conf.get("imdb_source") not in {"auto", "dataset", "omdb"}:
+            conf["imdb_source"] = "auto"
+        if config != conf:
+            self.update_config(conf)
         self._enabled = bool(conf.get("enable"))
         self._enable_imdb = bool(conf.get("enable_imdb"))
         self._enable_douban = bool(conf.get("enable_douban"))

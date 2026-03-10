@@ -17,9 +17,9 @@ from app.utils.http import AsyncRequestUtils
 
 class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
-    plugin_desc = "统一接管推荐、搜索、识别结果的评分，显示 TMDB / IMDb / 豆瓣 / Bangumi 中的最低分。"
+    plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.3.0"
+    plugin_version = "0.3.1"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -84,10 +84,10 @@ class MultiRatingsRecommend(_PluginBase):
         "async_bangumi_person_credits",
     )
     _RATING_ORDER = {
-        "豆瓣": 0,
-        "IMDb": 1,
-        "Bangumi": 2,
-        "TMDB": 3,
+        "TMDB": 0,
+        "豆瓣": 1,
+        "IMDb": 2,
+        "Bangumi": 3,
     }
     _OVERVIEW_PREFIXES = (
         "当前分：",
@@ -172,7 +172,8 @@ class MultiRatingsRecommend(_PluginBase):
                 },
                 "text": (
                     "插件会统一改写推荐页、搜索结果、媒体详情和工作流中的评分。"
-                    "卡片右上角显示最低分；详情页会在简介上方显示各平台评分串。"
+                    "卡片右上角优先显示 TMDB / 豆瓣 的低分，两者都缺失时回退 IMDb；"
+                    "详情页会在简介上方显示各平台评分串。"
                 ),
             },
             {
@@ -238,7 +239,8 @@ class MultiRatingsRecommend(_PluginBase):
                     f"当前状态：{'已启用' if self._enabled else '未启用'}；"
                     f"豆瓣：{'参与计算' if self._enable_douban else '不参与'}；"
                     f"IMDb：{'参与计算' if self._enable_imdb else '不参与'}；"
-                    f"最大补分条数：{self._max_items}"
+                    f"最大补分条数：{self._max_items}；"
+                    f"主评分策略：TMDB / 豆瓣 取低分，缺失时回退 IMDb"
                 ),
             }
         ]
@@ -276,13 +278,17 @@ class MultiRatingsRecommend(_PluginBase):
 
     def _handle_sync_media_item(self, method: str, *args, **kwargs):
         media = self._call_system_method(method, *args, **kwargs)
-        if not media:
+        if self._is_missing_media(media):
+            media = self._run_async(self._fallback_media_item(media, **kwargs))
+        if self._is_missing_media(media):
             return media
         return self._run_async(self._enrich_media(self._clone_media(media)))
 
     async def _handle_async_media_item(self, method: str, *args, **kwargs):
         media = await self._async_call_system_method(method, *args, **kwargs)
-        if not media:
+        if self._is_missing_media(media):
+            media = await self._fallback_media_item(media, **kwargs)
+        if self._is_missing_media(media):
             return media
         return await self._enrich_media(self._clone_media(media))
 
@@ -382,9 +388,11 @@ class MultiRatingsRecommend(_PluginBase):
         if not ratings:
             return media
 
-        ordered_ratings = sorted(ratings.items(), key=lambda item: (item[1], self._label_priority(item[0])))
-        media.vote_average = ordered_ratings[0][1]
-        media.tagline = self._merge_rating_tagline(ordered_ratings, media.tagline)
+        primary_rating = self._select_primary_rating(ratings)
+        display_ratings = self._display_ratings(ratings)
+        if primary_rating is not None:
+            media.vote_average = primary_rating
+        media.tagline = self._merge_rating_tagline(display_ratings, media.tagline)
         return media
 
     async def _resolve_tmdb_detail(self, media: MediaInfo) -> Optional[dict]:
@@ -397,6 +405,8 @@ class MultiRatingsRecommend(_PluginBase):
             matched_tmdb = await self._get_tmdbinfo_by_doubanid(media.douban_id, media_type)
         elif media.bangumi_id:
             matched_tmdb = await self._get_tmdbinfo_by_bangumiid(media.bangumi_id)
+        if not matched_tmdb:
+            matched_tmdb = await self._match_tmdbinfo_by_title(media)
 
         if not matched_tmdb:
             return None
@@ -406,6 +416,37 @@ class MultiRatingsRecommend(_PluginBase):
             media.tmdb_id = int(tmdb_id)
             return await self._get_tmdb_detail(media.tmdb_id, media_type)
         return matched_tmdb
+
+    async def _fallback_media_item(self, media: Optional[MediaInfo], **kwargs) -> Optional[MediaInfo]:
+        current = self._clone_media(media) if isinstance(media, MediaInfo) else MediaInfo()
+        media_type = self._get_media_type(kwargs.get("mtype") or current.type)
+        douban_id = kwargs.get("doubanid") or getattr(current, "douban_id", None)
+        bangumi_id = kwargs.get("bangumiid") or getattr(current, "bangumi_id", None)
+
+        if douban_id:
+            douban_info = await self._get_douban_info_by_id(str(douban_id), media_type)
+            if douban_info:
+                current.set_douban_info(douban_info)
+                if media_type and not current.type:
+                    current.type = media_type
+                return current
+            matched_tmdb = await self._get_tmdbinfo_by_doubanid(str(douban_id), media_type)
+            if matched_tmdb:
+                tmdb_id = matched_tmdb.get("id")
+                matched_type = media_type or self._get_media_type(matched_tmdb.get("media_type"))
+                detail = await self._get_tmdb_detail(int(tmdb_id), matched_type) if tmdb_id else matched_tmdb
+                if detail:
+                    fallback = MediaInfo(tmdb_info=detail)
+                    fallback.douban_id = str(douban_id)
+                    return fallback
+
+        if bangumi_id:
+            bangumi_info = await self.chain.async_bangumi_info(bangumiid=int(bangumi_id))
+            if bangumi_info:
+                current.set_bangumi_info(bangumi_info)
+                return current
+
+        return media
 
     async def _resolve_douban_info(self, media: MediaInfo) -> Optional[dict]:
         media_type = self._get_media_type(media.type)
@@ -450,6 +491,32 @@ class MultiRatingsRecommend(_PluginBase):
         if cache_key in self._tmdb_match_cache:
             return self._tmdb_match_cache[cache_key]
         info = await self._media_chain.async_get_tmdbinfo_by_bangumiid(bangumiid=int(bangumi_id))
+        self._tmdb_match_cache[cache_key] = info
+        return info
+
+    async def _match_tmdbinfo_by_title(self, media: MediaInfo) -> Optional[dict]:
+        media_type = self._get_media_type(media.type)
+        if not media_type:
+            return None
+        names = []
+        for value in [media.original_title, media.title, media.en_title, *(media.names or [])]:
+            if value and value not in names:
+                names.append(value)
+        if not names:
+            return None
+        cache_key = ("title", "|".join(names), str(media.year or ""), media_type.value)
+        if cache_key in self._tmdb_match_cache:
+            return self._tmdb_match_cache[cache_key]
+        info = None
+        for name in names:
+            info = await self.chain.async_match_tmdbinfo(
+                name=name,
+                mtype=media_type,
+                year=media.year,
+                season=media.season,
+            )
+            if info:
+                break
         self._tmdb_match_cache[cache_key] = info
         return info
 
@@ -549,6 +616,45 @@ class MultiRatingsRecommend(_PluginBase):
     @classmethod
     def _label_priority(cls, label: str) -> int:
         return cls._RATING_ORDER.get(label, 99)
+
+    @staticmethod
+    def _is_missing_media(media: Any) -> bool:
+        if media is None:
+            return True
+        if not isinstance(media, MediaInfo):
+            return False
+        return not any([
+            getattr(media, "title", None),
+            getattr(media, "tmdb_id", None),
+            getattr(media, "douban_id", None),
+            getattr(media, "bangumi_id", None),
+        ])
+
+    @classmethod
+    def _select_primary_rating(cls, ratings: Dict[str, float]) -> Optional[float]:
+        tmdb_rating = ratings.get("TMDB")
+        douban_rating = ratings.get("豆瓣")
+        if tmdb_rating is not None and douban_rating is not None:
+            return min(tmdb_rating, douban_rating)
+        if tmdb_rating is not None:
+            return tmdb_rating
+        if douban_rating is not None:
+            return douban_rating
+        imdb_rating = ratings.get("IMDb")
+        if imdb_rating is not None:
+            return imdb_rating
+        bangumi_rating = ratings.get("Bangumi")
+        if bangumi_rating is not None:
+            return bangumi_rating
+        return None
+
+    @classmethod
+    def _display_ratings(cls, ratings: Dict[str, float]) -> List[Tuple[str, float]]:
+        return [
+            (label, ratings[label])
+            for label in ("TMDB", "豆瓣", "IMDb", "Bangumi")
+            if ratings.get(label) is not None
+        ]
 
     @staticmethod
     def _source_label(media: MediaInfo) -> Optional[str]:

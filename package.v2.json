@@ -1,14 +1,15 @@
 {
   "MultiRatingsRecommend": {
     "name": "全平台低分保护",
-    "description": "统一接管 MoviePilot 的推荐、搜索、识别结果评分，显示 TMDB / IMDb / 豆瓣 / Bangumi 中的最低分。",
+    "description": "统一接管 MoviePilot 的推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。",
     "labels": "推荐,搜索,TMDB,IMDb,豆瓣,Bangumi,评分",
-    "version": "0.3.0",
+    "version": "0.3.1",
     "icon": "Moviepilot_A.png",
     "author": "jun9100",
     "level": 1,
     "release": false,
     "history": {
+      "v0.3.1": "调整主评分策略：vote_average 优先取 TMDB / 豆瓣 低分，两者都缺失时回退 IMDb；tagline 固定按 TMDB / 豆瓣 / IMDb / Bangumi 顺序展示；补充豆瓣榜单条目的 TMDB 匹配与详情兜底。",
       "v0.3.0": "扩展为全局评分接管：覆盖推荐页所有分类、媒体搜索、媒体详情和工作流获取媒体；移除 overview 里的提示文案，并在详情页 tagline 显示各平台评分。",
       "v0.2.0": "不再新增推荐分类，直接接管现有 TMDB 推荐接口；卡片右上角改为显示 TMDB / IMDb / 豆瓣 中的最低分，并自动清理推荐缓存。",
       "v0.1.1": "修复豆瓣评分补充链路：先匹配 douban_id，再按 douban_id 拉取详情，确保评分可写入推荐卡片简介。",

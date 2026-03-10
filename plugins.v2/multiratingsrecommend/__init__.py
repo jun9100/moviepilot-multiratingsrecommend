@@ -174,17 +174,16 @@ class MultiRatingsRecommend(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        plugin_id = self.__class__.__name__
         return [
             {
-                "path": f"/{plugin_id}/imdb/status",
+                "path": "/imdb/status",
                 "endpoint": self.api_imdb_status,
                 "methods": ["GET"],
                 "summary": "获取 IMDb 数据集状态",
                 "description": "返回 IMDb 数据集索引和 OMDb 熔断状态",
             },
             {
-                "path": f"/{plugin_id}/imdb/rebuild",
+                "path": "/imdb/rebuild",
                 "endpoint": self.api_imdb_rebuild,
                 "methods": ["POST"],
                 "summary": "重建 IMDb 数据集索引",

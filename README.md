@@ -1,17 +1,15 @@
 # MultiRatingsRecommend（MoviePilot 插件）
 
-`MultiRatingsRecommend` 为 MoviePilot 2.0 推荐页新增三条基于 TMDB 的多评分推荐源：
+`MultiRatingsRecommend` 会直接接管 MoviePilot 2.0 现有的 TMDB 推荐行，不再新增推荐分类。
 
-- `TMDB流行趋势+IMDb/豆瓣`
-- `TMDB热门电影+IMDb/豆瓣`
-- `TMDB热门电视剧+IMDb/豆瓣`
+它的行为是：
 
-插件会保留卡片右上角的 `TMDB vote_average`，并补充：
+- 保留原来的 `流行趋势 / TMDB热门电影 / TMDB热门电视剧` 位置不变
+- 补充 `IMDb` 和 `豆瓣` 评分
+- 从 `TMDB / IMDb / 豆瓣` 中选出最低分，回填到卡片右上角的 `vote_average`
+- 在卡片简介首行写明当前分数来源，并列出全部已获取评分
 
-- `IMDb` 评分
-- `豆瓣` 评分
-
-当前 MoviePilot 2.0 推荐卡片右上角只能直接显示 `vote_average`，因此 IMDb 和豆瓣评分会写入卡片悬浮详情中的简介前缀。
+这样做的目的，是避免单独使用 TMDB 分数误导判断。
 
 ## 仓库结构
 
@@ -23,31 +21,30 @@
 
 1. 在 MoviePilot 中通过插件仓库地址安装本仓库。
 2. 安装插件 `MultiRatingsRecommend`。
-3. 在插件配置页启用插件，并按需填写 `OMDb API Key` 以启用 IMDb 评分补充。
+3. 在插件配置页启用插件，并按需填写 `OMDb API Key` 以启用 IMDb 评分。
 
-> 当前文档对应版本：`v0.1.1`
+> 当前文档对应版本：`v0.2.0`
 
 ## 配置项
 
 - `enable`: 启用插件
-- `enable_douban`: 补充豆瓣评分
-- `enable_imdb`: 补充 IMDb 评分
+- `enable_douban`: 是否让豆瓣参与最低分计算
+- `enable_imdb`: 是否让 IMDb 参与最低分计算
 - `omdb_api_key`: OMDb API Key
-- `max_items`: 每个推荐源每页补充分数的最大条数
+- `max_items`: 每页最多补分条数，超出部分保留原始 TMDB 分数
 
-## 插件 API
+## 展示说明
 
-- `/api/v1/plugin/MultiRatingsRecommend/recommend/tmdb_trending`
-- `/api/v1/plugin/MultiRatingsRecommend/recommend/tmdb_movies`
-- `/api/v1/plugin/MultiRatingsRecommend/recommend/tmdb_tvs`
+- 右上角只支持显示一个数字，因此插件会直接写入最低分。
+- 右上角当前无法同时显示“分数来源站点名称”，这是 MoviePilot 前端卡片组件的限制。
+- 卡片简介首行会写成类似：
 
-认证方式：
-
-- `X-API-KEY: <MoviePilot API_TOKEN>`
-- 或浏览器登录态 / Bearer Token
+```text
+当前分：豆瓣 6.4（取最低分）
+全部评分：豆瓣 6.4 / TMDB 7.2 / IMDb 8.8
+```
 
 ## 说明
 
-- 推荐卡右上角仍显示 `TMDB` 分数，这是 MoviePilot 当前卡片组件的限制。
-- `IMDb` 和 `豆瓣` 评分会追加到卡片 hover 详情里的简介首行。
-- 如果你需要把卡片右上角直接改为 IMDb，必须同时修改 MoviePilot 前端卡片组件。
+- 插件升级或配置变化时，会自动清理推荐缓存，避免页面继续显示旧的 TMDB 分数。
+- 如果没有拿到 IMDb 或豆瓣评分，插件会回退为 TMDB 分数。

@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import re
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi.concurrency import run_in_threadpool
@@ -19,7 +20,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.3.1"
+    plugin_version = "0.3.2"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -112,6 +113,8 @@ class MultiRatingsRecommend(_PluginBase):
         self._tmdb_match_cache: Dict[Tuple[str, str, str], Optional[dict]] = {}
         self._imdb_rating_cache: Dict[str, Optional[float]] = {}
         self._douban_info_cache: Dict[Tuple[str, str, str], Optional[dict]] = {}
+        self._imdb_blocked_until: float = 0
+        self._imdb_block_reason: str = ""
 
     @staticmethod
     def _default_config() -> Dict[str, Any]:
@@ -241,6 +244,7 @@ class MultiRatingsRecommend(_PluginBase):
                     f"IMDb：{'参与计算' if self._enable_imdb else '不参与'}；"
                     f"最大补分条数：{self._max_items}；"
                     f"主评分策略：TMDB / 豆瓣 取低分，缺失时回退 IMDb"
+                    + (f"；IMDb 状态：{self._imdb_block_reason}" if self._imdb_blocked_until > time.time() else "")
                 ),
             }
         ]
@@ -255,6 +259,8 @@ class MultiRatingsRecommend(_PluginBase):
         self._tmdb_match_cache.clear()
         self._imdb_rating_cache.clear()
         self._douban_info_cache.clear()
+        self._imdb_blocked_until = 0
+        self._imdb_block_reason = ""
 
     def _make_sync_item_handler(self, method: str):
         def handler(*args, **kwargs):
@@ -574,6 +580,8 @@ class MultiRatingsRecommend(_PluginBase):
     async def _get_imdb_rating(self, imdb_id: str) -> Optional[float]:
         if not self._omdb_api_key:
             return None
+        if self._imdb_blocked_until > time.time():
+            return None
         if imdb_id in self._imdb_rating_cache:
             return self._imdb_rating_cache[imdb_id]
         data = await AsyncRequestUtils(timeout=10).get_json(
@@ -586,6 +594,12 @@ class MultiRatingsRecommend(_PluginBase):
         rating = None
         if data and data.get("Response") == "True":
             rating = self._normalize_rating(data.get("imdbRating"))
+        elif data and data.get("Error"):
+            error_message = str(data.get("Error"))
+            if "limit" in error_message.lower():
+                self._imdb_blocked_until = time.time() + 12 * 3600
+                self._imdb_block_reason = error_message
+                logger.warn(f"IMDb 评分接口已触发限额熔断：{error_message}")
         self._imdb_rating_cache[imdb_id] = rating
         return rating
 
@@ -709,9 +723,6 @@ class MultiRatingsRecommend(_PluginBase):
     @classmethod
     def _merge_rating_tagline(cls, ratings: List[Tuple[str, float]], tagline: Optional[str]) -> str:
         rating_line = " / ".join(f"{label} {value:.1f}" for label, value in ratings)
-        clean_tagline = cls._strip_rating_tagline(tagline)
-        if clean_tagline:
-            return f"{rating_line} · {clean_tagline}"
         return rating_line
 
     @classmethod

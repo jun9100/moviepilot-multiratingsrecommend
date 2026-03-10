@@ -33,7 +33,7 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 2. 安装插件 `MultiRatingsRecommend`。
 3. 在插件配置页启用插件，并按需填写 `OMDb API Key` 或 IMDb 官方数据集路径。
 
-> 当前文档对应版本：`v0.6.2`
+> 当前文档对应版本：`v0.6.3`
 
 ## 配置项
 
@@ -42,6 +42,7 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 - `enable_imdb`: 是否启用 IMDb 回退评分
 - `enable_external_douban`: 是否启用外部豆瓣详情 API 兜底
 - `external_douban_url_template`: 外部豆瓣详情 URL 模板，支持 `{douban_id} {media_type} {title} {year}`
+- `douban_web_cookie`: 豆瓣网页 Cookie（可选），用于网页评分兜底在需要登录态时继续抓取评分
 - `enable_diagnostics`: 是否在插件页显示最近补分诊断记录
 - `imdb_source`: IMDb 数据来源，可选 `auto / dataset / omdb`
 - `imdb_ratings_path`: IMDb 官方 `title.ratings.tsv` 或 `title.ratings.tsv.gz` 的本地路径

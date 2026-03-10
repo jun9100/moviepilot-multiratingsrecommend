@@ -26,7 +26,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.2"
+    plugin_version = "0.6.3"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -116,6 +116,7 @@ class MultiRatingsRecommend(_PluginBase):
         self._enable_douban = True
         self._enable_external_douban = False
         self._external_douban_url_template = ""
+        self._douban_web_cookie = ""
         self._enable_diagnostics = False
         self._imdb_source = "auto"
         self._imdb_ratings_path = ""
@@ -147,6 +148,7 @@ class MultiRatingsRecommend(_PluginBase):
             "enable_douban": True,
             "enable_external_douban": False,
             "external_douban_url_template": "",
+            "douban_web_cookie": "",
             "enable_diagnostics": False,
             "imdb_source": "auto",
             "imdb_ratings_path": "",
@@ -166,6 +168,7 @@ class MultiRatingsRecommend(_PluginBase):
         self._enable_douban = bool(conf.get("enable_douban"))
         self._enable_external_douban = bool(conf.get("enable_external_douban"))
         self._external_douban_url_template = str(conf.get("external_douban_url_template") or "").strip()
+        self._douban_web_cookie = str(conf.get("douban_web_cookie") or "").strip()
         self._enable_diagnostics = bool(conf.get("enable_diagnostics"))
         self._imdb_source = str(conf.get("imdb_source") or "auto").strip().lower()
         self._imdb_ratings_path = str(conf.get("imdb_ratings_path") or "").strip()
@@ -280,6 +283,21 @@ class MultiRatingsRecommend(_PluginBase):
                     "class": "mb-2",
                     "disabled": "{{ !enable || !enable_douban || !enable_external_douban }}",
                     "hint": "支持变量：{douban_id} {media_type} {title} {year}",
+                    "persistent-hint": True,
+                },
+            },
+            {
+                "component": "VTextarea",
+                "props": {
+                    "model": "douban_web_cookie",
+                    "label": "豆瓣网页 Cookie（可选）",
+                    "placeholder": "例如：bid=...; dbcl2=...; ck=...",
+                    "rows": 2,
+                    "auto-grow": True,
+                    "clearable": True,
+                    "class": "mb-2",
+                    "disabled": "{{ !enable || !enable_douban }}",
+                    "hint": "用于豆瓣网页评分兜底（error code:004 时需要登录态 Cookie）",
                     "persistent-hint": True,
                 },
             },
@@ -840,6 +858,7 @@ class MultiRatingsRecommend(_PluginBase):
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "referer": "https://movie.douban.com/",
                 },
+                cookies=self._douban_web_cookie or None,
             ).get(url)
             if not html:
                 self._douban_web_rating_cache[douban_id] = None

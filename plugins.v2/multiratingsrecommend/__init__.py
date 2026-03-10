@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import quote_plus
 
 from fastapi.concurrency import run_in_threadpool
 
@@ -25,7 +26,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.5.1"
+    plugin_version = "0.6.0"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -97,6 +98,7 @@ class MultiRatingsRecommend(_PluginBase):
     }
     _LIST_ENRICH_CONCURRENCY = 6
     _OMDB_BLOCK_STATE_KEY = "omdb_block_state"
+    _DIAGNOSTIC_KEEP = 30
     _OVERVIEW_PREFIXES = (
         "当前分：",
         "全部评分：",
@@ -112,6 +114,9 @@ class MultiRatingsRecommend(_PluginBase):
         self._enabled = True
         self._enable_imdb = True
         self._enable_douban = True
+        self._enable_external_douban = False
+        self._external_douban_url_template = ""
+        self._enable_diagnostics = False
         self._imdb_source = "auto"
         self._imdb_ratings_path = ""
         self._omdb_api_key = ""
@@ -130,6 +135,8 @@ class MultiRatingsRecommend(_PluginBase):
         self._imdb_dataset_building = False
         self._imdb_dataset_build_thread: Optional[Thread] = None
         self._imdb_dataset_build_error = ""
+        self._external_douban_status = "未启用"
+        self._diagnostic_records: List[Dict[str, Any]] = []
 
     @staticmethod
     def _default_config() -> Dict[str, Any]:
@@ -137,6 +144,9 @@ class MultiRatingsRecommend(_PluginBase):
             "enable": True,
             "enable_imdb": True,
             "enable_douban": True,
+            "enable_external_douban": False,
+            "external_douban_url_template": "",
+            "enable_diagnostics": False,
             "imdb_source": "auto",
             "imdb_ratings_path": "",
             "omdb_api_key": "",
@@ -153,6 +163,9 @@ class MultiRatingsRecommend(_PluginBase):
         self._enabled = bool(conf.get("enable"))
         self._enable_imdb = bool(conf.get("enable_imdb"))
         self._enable_douban = bool(conf.get("enable_douban"))
+        self._enable_external_douban = bool(conf.get("enable_external_douban"))
+        self._external_douban_url_template = str(conf.get("external_douban_url_template") or "").strip()
+        self._enable_diagnostics = bool(conf.get("enable_diagnostics"))
         self._imdb_source = str(conf.get("imdb_source") or "auto").strip().lower()
         self._imdb_ratings_path = str(conf.get("imdb_ratings_path") or "").strip()
         self._omdb_api_key = (conf.get("omdb_api_key") or "").strip()
@@ -217,7 +230,8 @@ class MultiRatingsRecommend(_PluginBase):
                 "text": (
                     "插件会统一改写推荐页、搜索结果、媒体详情和工作流中的评分。"
                     "卡片右上角优先显示 TMDB / 豆瓣 的低分，两者都缺失时回退 IMDb；"
-                    "详情页会在简介上方显示各平台评分串。IMDb 支持本地数据集优先模式。"
+                    "详情页会在简介上方显示各平台评分串。IMDb 支持本地数据集优先模式；"
+                    "豆瓣支持额外配置外部详情 API 兜底。"
                 ),
             },
             {
@@ -244,6 +258,28 @@ class MultiRatingsRecommend(_PluginBase):
                     "label": "参与 IMDb 评分",
                     "class": "mb-2",
                     "disabled": "{{ !enable }}",
+                },
+            },
+            {
+                "component": "VSwitch",
+                "props": {
+                    "model": "enable_external_douban",
+                    "label": "启用外部豆瓣详情 API 兜底",
+                    "class": "mb-2",
+                    "disabled": "{{ !enable || !enable_douban }}",
+                },
+            },
+            {
+                "component": "VTextField",
+                "props": {
+                    "model": "external_douban_url_template",
+                    "label": "外部豆瓣详情 URL 模板",
+                    "placeholder": "例如：http://127.0.0.1:8080/douban/subject/{douban_id}",
+                    "clearable": True,
+                    "class": "mb-2",
+                    "disabled": "{{ !enable || !enable_douban || !enable_external_douban }}",
+                    "hint": "支持变量：{douban_id} {media_type} {title} {year}",
+                    "persistent-hint": True,
                 },
             },
             {
@@ -296,10 +332,19 @@ class MultiRatingsRecommend(_PluginBase):
                     "disabled": "{{ !enable }}",
                 },
             },
+            {
+                "component": "VSwitch",
+                "props": {
+                    "model": "enable_diagnostics",
+                    "label": "启用补分诊断记录",
+                    "class": "mb-2",
+                    "disabled": "{{ !enable }}",
+                },
+            },
         ], self._default_config()
 
     def get_page(self) -> Optional[List[dict]]:
-        return [
+        page = [
             {
                 "component": "VAlert",
                 "props": {
@@ -309,6 +354,7 @@ class MultiRatingsRecommend(_PluginBase):
                 "text": (
                     f"当前状态：{'已启用' if self._enabled else '未启用'}；"
                     f"豆瓣：{'参与计算' if self._enable_douban else '不参与'}；"
+                    f"外部豆瓣：{self._external_douban_status}；"
                     f"IMDb：{'参与计算' if self._enable_imdb else '不参与'}；"
                     f"IMDb 来源：{self._imdb_source}；"
                     f"最大补分条数：{self._max_items}；"
@@ -319,6 +365,19 @@ class MultiRatingsRecommend(_PluginBase):
                 ),
             }
         ]
+        if self._enable_diagnostics:
+            page.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "warning",
+                        "variant": "tonal",
+                        "class": "mt-3",
+                    },
+                    "text": self._diagnostic_summary_text(),
+                }
+            )
+        return page
 
     def api_imdb_status(self) -> Dict[str, Any]:
         return self._get_imdb_status_payload()
@@ -348,6 +407,10 @@ class MultiRatingsRecommend(_PluginBase):
         self._imdb_dataset_building = False
         self._imdb_dataset_build_thread = None
         self._imdb_dataset_build_error = ""
+        self._external_douban_status = "已配置" if self._enable_external_douban and self._external_douban_url_template else (
+            "未配置" if self._enable_external_douban else "未启用"
+        )
+        self._diagnostic_records.clear()
 
     def _make_sync_item_handler(self, method: str):
         def handler(*args, **kwargs):
@@ -456,20 +519,26 @@ class MultiRatingsRecommend(_PluginBase):
         media.tagline = ""
 
         ratings: Dict[str, float] = {}
+        diagnostic_notes: List[str] = []
         source_label = self._source_label(media)
         current_rating = self._normalize_rating(media.vote_average)
         if source_label and current_rating is not None:
             ratings[source_label] = current_rating
+            diagnostic_notes.append(f"初始评分：{source_label} {current_rating:.1f}")
 
         tmdb_detail = await self._resolve_tmdb_detail(media)
         if tmdb_detail:
             tmdb_rating = self._normalize_rating(tmdb_detail.get("vote_average"))
             if tmdb_rating is not None:
                 ratings["TMDB"] = tmdb_rating
+                diagnostic_notes.append(f"TMDB：{tmdb_rating:.1f}")
             imdb_id = self._extract_imdb_id(tmdb_detail)
             if imdb_id:
                 media.imdb_id = imdb_id
+        else:
+            diagnostic_notes.append("TMDB：未补到详情")
 
+        douban_info = None
         if self._enable_douban:
             douban_info = await self._resolve_douban_info(media)
             if douban_info:
@@ -479,13 +548,32 @@ class MultiRatingsRecommend(_PluginBase):
                 douban_rating = self._extract_douban_rating(douban_info)
                 if douban_rating is not None:
                     ratings["豆瓣"] = douban_rating
+                    diagnostic_notes.append(
+                        f"豆瓣：{douban_rating:.1f}（{douban_info.get('__mr_source') or '内置'}）"
+                    )
+                else:
+                    diagnostic_notes.append(
+                        f"豆瓣：已命中 {douban_info.get('__mr_source') or '内置'}，但无评分"
+                    )
+            else:
+                diagnostic_notes.append("豆瓣：未匹配到")
 
         if self._enable_imdb and media.imdb_id:
             imdb_rating = await self._get_imdb_rating(media.imdb_id)
             if imdb_rating is not None:
                 ratings["IMDb"] = imdb_rating
+                diagnostic_notes.append(f"IMDb：{imdb_rating:.1f}")
+            elif self._imdb_blocked_until > time.time():
+                diagnostic_notes.append("IMDb：OMDb 限额熔断中")
+            elif self._imdb_source in {"auto", "dataset"} and self._imdb_dataset_status in {"未配置数据集路径", "数据集路径不存在"}:
+                diagnostic_notes.append(f"IMDb：数据集不可用（{self._imdb_dataset_status}）")
+            else:
+                diagnostic_notes.append("IMDb：未命中")
+        elif self._enable_imdb:
+            diagnostic_notes.append("IMDb：无 imdb_id")
 
         if not ratings:
+            self._record_diagnostic(media, ratings, None, diagnostic_notes)
             return media
 
         primary_rating = self._select_primary_rating(ratings)
@@ -493,6 +581,9 @@ class MultiRatingsRecommend(_PluginBase):
         if primary_rating is not None:
             media.vote_average = primary_rating
         media.tagline = self._merge_rating_tagline(display_ratings, media.tagline)
+        if primary_rating is not None:
+            diagnostic_notes.append(f"主评分：{primary_rating:.1f}")
+        self._record_diagnostic(media, ratings, primary_rating, diagnostic_notes)
         return media
 
     async def _resolve_tmdb_detail(self, media: MediaInfo) -> Optional[dict]:
@@ -524,7 +615,7 @@ class MultiRatingsRecommend(_PluginBase):
         bangumi_id = kwargs.get("bangumiid") or getattr(current, "bangumi_id", None)
 
         if douban_id:
-            douban_info = await self._get_douban_info_by_id(str(douban_id), media_type)
+            douban_info = await self._get_douban_info_by_id(str(douban_id), media_type, current)
             if douban_info:
                 current.set_douban_info(douban_info)
                 if media_type and not current.type:
@@ -552,7 +643,7 @@ class MultiRatingsRecommend(_PluginBase):
         media_type = self._get_media_type(media.type)
         douban_info = None
         if media.douban_id:
-            douban_info = await self._get_douban_info_by_id(media.douban_id, media_type)
+            douban_info = await self._get_douban_info_by_id(media.douban_id, media_type, media)
             if douban_info and self._extract_douban_rating(douban_info) is not None:
                 return douban_info
 
@@ -575,7 +666,7 @@ class MultiRatingsRecommend(_PluginBase):
             )
         douban_id = douban_info.get("id") if douban_info else None
         if douban_id and self._extract_douban_rating(douban_info) is None:
-            detail = await self._get_douban_info_by_id(str(douban_id), media_type)
+            detail = await self._get_douban_info_by_id(str(douban_id), media_type, media)
             if detail:
                 douban_info = detail
 
@@ -634,7 +725,10 @@ class MultiRatingsRecommend(_PluginBase):
         cache_key = ("tmdb", str(tmdb_id), media_type.value if media_type else "")
         if cache_key in self._douban_info_cache:
             return self._douban_info_cache[cache_key]
-        info = await self._media_chain.async_get_doubaninfo_by_tmdbid(tmdbid=int(tmdb_id), mtype=media_type)
+        info = self._annotate_douban_info(
+            await self._media_chain.async_get_doubaninfo_by_tmdbid(tmdbid=int(tmdb_id), mtype=media_type),
+            "TMDB映射",
+        )
         self._douban_info_cache[cache_key] = info
         return info
 
@@ -642,22 +736,39 @@ class MultiRatingsRecommend(_PluginBase):
         cache_key = ("bangumi", str(bangumi_id), "")
         if cache_key in self._douban_info_cache:
             return self._douban_info_cache[cache_key]
-        info = await self._media_chain.async_get_doubaninfo_by_bangumiid(bangumiid=int(bangumi_id))
+        info = self._annotate_douban_info(
+            await self._media_chain.async_get_doubaninfo_by_bangumiid(bangumiid=int(bangumi_id)),
+            "Bangumi映射",
+        )
         self._douban_info_cache[cache_key] = info
         return info
 
-    async def _get_douban_info_by_id(self, douban_id: str, media_type: Optional[MediaType]) -> Optional[dict]:
+    async def _get_douban_info_by_id(
+        self,
+        douban_id: str,
+        media_type: Optional[MediaType],
+        media: Optional[MediaInfo] = None,
+    ) -> Optional[dict]:
         cache_key = ("id", str(douban_id), media_type.value if media_type else "")
         if cache_key in self._douban_info_cache:
             return self._douban_info_cache[cache_key]
-        info = await self.chain.async_douban_info(doubanid=str(douban_id), mtype=media_type, raise_exception=False)
+        info = self._annotate_douban_info(
+            await self.chain.async_douban_info(doubanid=str(douban_id), mtype=media_type, raise_exception=False),
+            "内置详情",
+        )
         if not info and media_type:
             fallback_key = ("id", str(douban_id), "")
             if fallback_key in self._douban_info_cache:
                 info = self._douban_info_cache[fallback_key]
             else:
-                info = await self.chain.async_douban_info(doubanid=str(douban_id), mtype=None, raise_exception=False)
+                info = self._annotate_douban_info(
+                    await self.chain.async_douban_info(doubanid=str(douban_id), mtype=None, raise_exception=False),
+                    "内置详情",
+                )
                 self._douban_info_cache[fallback_key] = info
+        if (not info or self._extract_douban_rating(info) is None) and self._enable_external_douban:
+            external_info = await self._get_external_douban_info_by_id(str(douban_id), media_type, media)
+            info = self._prefer_douban_info(info, external_info)
         if info and not info.get("id"):
             info["id"] = str(douban_id)
         self._douban_info_cache[cache_key] = info
@@ -686,9 +797,10 @@ class MultiRatingsRecommend(_PluginBase):
                     season=media.season,
                     raise_exception=False,
                 )
+                matched = self._annotate_douban_info(matched, f"标题匹配:{title or media.title}")
                 douban_id = matched.get("id") if matched else None
                 if douban_id:
-                    detail = await self._get_douban_info_by_id(str(douban_id), self._get_media_type(media.type))
+                    detail = await self._get_douban_info_by_id(str(douban_id), self._get_media_type(media.type), media)
                     if detail:
                         if not detail.get("id"):
                             detail["id"] = str(douban_id)
@@ -700,6 +812,115 @@ class MultiRatingsRecommend(_PluginBase):
                 logger.warn(f"豆瓣评分补充失败：{title or media.title} - {err}")
         self._douban_info_cache[cache_key] = info
         return info
+
+    async def _get_external_douban_info_by_id(
+        self,
+        douban_id: str,
+        media_type: Optional[MediaType],
+        media: Optional[MediaInfo] = None,
+    ) -> Optional[dict]:
+        cache_key = ("external", str(douban_id), media_type.value if media_type else "")
+        if cache_key in self._douban_info_cache:
+            return self._douban_info_cache[cache_key]
+        if not self._enable_external_douban or not self._external_douban_url_template:
+            self._external_douban_status = "未配置"
+            self._douban_info_cache[cache_key] = None
+            return None
+        media_type_value = media_type.value if media_type else ""
+        try:
+            title = media.title if media else ""
+            year = media.year if media else ""
+            url = self._external_douban_url_template.format(
+                douban_id=str(douban_id),
+                media_type=media_type_value,
+                title=quote_plus(str(title or "")),
+                year=quote_plus(str(year or "")),
+            )
+        except Exception as err:
+            self._external_douban_status = f"模板错误：{err}"
+            logger.warn(f"外部豆瓣 URL 模板错误：{err}")
+            self._douban_info_cache[cache_key] = None
+            return None
+        try:
+            payload = await AsyncRequestUtils(timeout=8).get_json(url)
+            info = self._normalize_external_douban_info(payload, douban_id)
+            if info:
+                self._external_douban_status = "已配置且可用"
+                self._douban_info_cache[cache_key] = info
+                return info
+            self._external_douban_status = "已配置但未返回有效详情"
+        except Exception as err:
+            self._external_douban_status = f"最近错误：{err}"
+            logger.warn(f"外部豆瓣详情请求失败：{douban_id} - {err}")
+        self._douban_info_cache[cache_key] = None
+        return None
+
+    def _normalize_external_douban_info(self, payload: Any, douban_id: str) -> Optional[dict]:
+        data = payload
+        visited = set()
+        while isinstance(data, dict):
+            next_data = None
+            for key in ("data", "result", "subject", "item"):
+                value = data.get(key)
+                if value and id(value) not in visited:
+                    next_data = value
+                    visited.add(id(value))
+                    break
+            if next_data is None:
+                break
+            data = next_data
+        if isinstance(data, list):
+            if not data:
+                return None
+            rated_item = None
+            for item in data:
+                normalized = self._normalize_external_douban_info(item, douban_id)
+                if normalized and self._extract_douban_rating(normalized) is not None:
+                    rated_item = normalized
+                    break
+            if rated_item:
+                return rated_item
+            data = data[0]
+        if not isinstance(data, dict):
+            return None
+        info = dict(data)
+        if not info.get("id"):
+            info["id"] = str(info.get("douban_id") or douban_id)
+        rating = info.get("rating")
+        if isinstance(rating, (int, float, str)):
+            normalized = self._normalize_rating(rating)
+            info["rating"] = {"value": normalized} if normalized is not None else {}
+        elif isinstance(rating, dict):
+            if "value" not in rating:
+                for key in ("average", "score", "rating"):
+                    normalized = self._normalize_rating(rating.get(key))
+                    if normalized is not None:
+                        info["rating"] = {"value": normalized}
+                        break
+        else:
+            for key in ("score", "average_rating", "average"):
+                normalized = self._normalize_rating(info.get(key))
+                if normalized is not None:
+                    info["rating"] = {"value": normalized}
+                    break
+        if not info.get("title") and info.get("name"):
+            info["title"] = info.get("name")
+        if not info.get("original_title") and info.get("original_name"):
+            info["original_title"] = info.get("original_name")
+        if not info.get("intro") and info.get("summary"):
+            info["intro"] = info.get("summary")
+        if not info.get("pubdate") and info.get("release_date"):
+            info["pubdate"] = [info.get("release_date")]
+        if not info.get("countries") and info.get("country"):
+            country = info.get("country")
+            info["countries"] = country if isinstance(country, list) else [country]
+        if not info.get("genres") and info.get("genre"):
+            genre = info.get("genre")
+            info["genres"] = genre if isinstance(genre, list) else [genre]
+        if not info.get("durations") and info.get("duration"):
+            duration = info.get("duration")
+            info["durations"] = duration if isinstance(duration, list) else [duration]
+        return self._annotate_douban_info(info, "外部API")
 
     async def _get_imdb_rating(self, imdb_id: str) -> Optional[float]:
         if not imdb_id:
@@ -897,6 +1118,8 @@ class MultiRatingsRecommend(_PluginBase):
             "enabled": self._enabled,
             "imdb_enabled": self._enable_imdb,
             "imdb_source": self._imdb_source,
+            "external_douban_enabled": self._enable_external_douban,
+            "external_douban_status": self._external_douban_status,
             "dataset_path": self._imdb_ratings_path,
             "dataset_status": self._imdb_dataset_status,
             "dataset_building": self._imdb_dataset_building,
@@ -1022,6 +1245,14 @@ class MultiRatingsRecommend(_PluginBase):
         return normalized
 
     @staticmethod
+    def _annotate_douban_info(info: Optional[dict], source: str) -> Optional[dict]:
+        if not info:
+            return None
+        annotated = dict(info)
+        annotated["__mr_source"] = source
+        return annotated
+
+    @staticmethod
     def _candidate_titles(media: MediaInfo) -> List[str]:
         names: List[str] = []
         for value in [media.title, media.original_title, media.en_title, *(media.names or [])]:
@@ -1034,6 +1265,35 @@ class MultiRatingsRecommend(_PluginBase):
             if title_no_season and title_no_season not in names:
                 names.append(title_no_season)
         return names
+
+    def _record_diagnostic(
+        self,
+        media: MediaInfo,
+        ratings: Dict[str, float],
+        primary_rating: Optional[float],
+        notes: List[str],
+    ):
+        if not self._enable_diagnostics:
+            return
+        record = {
+            "time": time.strftime("%m-%d %H:%M:%S", time.localtime()),
+            "title": media.title or media.original_title or media.en_title or "未知条目",
+            "ids": f"tmdb:{media.tmdb_id or '-'} douban:{media.douban_id or '-'} imdb:{media.imdb_id or '-'} bgm:{media.bangumi_id or '-'}",
+            "ratings": self._merge_rating_tagline(self._display_ratings(ratings), None) if ratings else "无评分",
+            "primary": f"{primary_rating:.1f}" if primary_rating is not None else "-",
+            "notes": "；".join(note for note in notes if note),
+        }
+        self._diagnostic_records.insert(0, record)
+        del self._diagnostic_records[self._DIAGNOSTIC_KEEP:]
+
+    def _diagnostic_summary_text(self) -> str:
+        if not self._diagnostic_records:
+            return "诊断记录：暂无数据。"
+        lines = [
+            f"{item['time']} {item['title']} | 主评分 {item['primary']} | {item['ratings']} | {item['notes']}"
+            for item in self._diagnostic_records[:8]
+        ]
+        return "最近诊断： " + " || ".join(lines)
 
     @classmethod
     def _prefer_douban_info(cls, current: Optional[dict], candidate: Optional[dict]) -> Optional[dict]:

@@ -824,31 +824,83 @@ class MultiRatingsRecommend(_PluginBase):
         if cache_key in self._douban_info_cache:
             return self._douban_info_cache[cache_key]
         info = None
+        media_type = self._get_media_type(media.type)
         for title in titles or [media.title or ""]:
-            try:
-                matched = await self.chain.async_match_doubaninfo(
-                    name=title or "",
-                    imdbid=imdb_id,
-                    mtype=self._get_media_type(media.type),
-                    year=media.year,
-                    season=media.season,
-                    raise_exception=False,
-                )
-                matched = self._annotate_douban_info(matched, f"标题匹配:{title or media.title}")
-                douban_id = matched.get("id") if matched else None
-                if douban_id:
-                    detail = await self._get_douban_info_by_id(str(douban_id), self._get_media_type(media.type), media)
-                    if detail:
-                        if not detail.get("id"):
-                            detail["id"] = str(douban_id)
-                        matched = detail
-                info = self._prefer_douban_info(info, matched)
-                if info and self._extract_douban_rating(info) is not None:
-                    break
-            except Exception as err:
-                logger.warn(f"豆瓣评分补充失败：{title or media.title} - {err}")
+            attempts = self._build_douban_match_attempts(
+                title=title or media.title or "",
+                media_type=media_type,
+                year=media.year,
+                season=media.season,
+                imdb_id=imdb_id,
+            )
+            for attempt in attempts:
+                try:
+                    matched = await self.chain.async_match_doubaninfo(
+                        name=attempt["title"],
+                        imdbid=attempt["imdbid"],
+                        mtype=attempt["media_type"],
+                        year=attempt["year"],
+                        season=attempt["season"],
+                        raise_exception=False,
+                    )
+                    matched = self._annotate_douban_info(matched, attempt["source"])
+                    douban_id = matched.get("id") if matched else None
+                    if douban_id:
+                        detail = await self._get_douban_info_by_id(str(douban_id), media_type, media)
+                        if detail:
+                            if not detail.get("id"):
+                                detail["id"] = str(douban_id)
+                            matched = self._prefer_douban_info(matched, detail)
+                    info = self._prefer_douban_info(info, matched)
+                    if info and self._extract_douban_rating(info) is not None:
+                        self._douban_info_cache[cache_key] = info
+                        return info
+                except Exception as err:
+                    logger.warn(f"豆瓣评分补充失败：{attempt['title']} - {err}")
         self._douban_info_cache[cache_key] = info
         return info
+
+    @staticmethod
+    def _build_douban_match_attempts(
+        title: str,
+        media_type: Optional[MediaType],
+        year: Optional[str],
+        season: Optional[int],
+        imdb_id: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        attempts: List[Dict[str, Any]] = []
+        normalized_title = str(title or "").strip()
+        if not normalized_title:
+            return attempts
+
+        def add_attempt(
+            source: str,
+            imdb_value: Optional[str],
+            year_value: Optional[str],
+            season_value: Optional[int],
+        ) -> None:
+            key = (normalized_title, imdb_value or "", year_value or "", season_value or 0, media_type.value if media_type else "")
+            if any(item.get("_key") == key for item in attempts):
+                return
+            attempts.append(
+                {
+                    "_key": key,
+                    "title": normalized_title,
+                    "imdbid": imdb_value,
+                    "media_type": media_type,
+                    "year": year_value,
+                    "season": season_value,
+                    "source": source,
+                }
+            )
+
+        add_attempt(f"标题匹配:{normalized_title}", imdb_id, year, season)
+        add_attempt(f"标题匹配(无IMDb):{normalized_title}", None, year, season)
+        add_attempt(f"标题宽松:{normalized_title}", None, year, None)
+        add_attempt(f"标题宽松(无年份):{normalized_title}", None, None, None)
+        for attempt in attempts:
+            attempt.pop("_key", None)
+        return attempts
 
     async def _get_external_douban_info_by_id(
         self,

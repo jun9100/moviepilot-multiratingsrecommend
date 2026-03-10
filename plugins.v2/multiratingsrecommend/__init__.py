@@ -419,6 +419,11 @@ class MultiRatingsRecommend(_PluginBase):
             douban_info = await self._get_doubaninfo_by_bangumiid(media.bangumi_id)
         if not douban_info and (media.imdb_id or media.title):
             douban_info = await self._match_douban_info(media, media.imdb_id)
+        douban_id = douban_info.get("id") if douban_info else None
+        if douban_id and self._extract_douban_rating(douban_info) is None:
+            detail = await self._get_douban_info_by_id(str(douban_id), media_type)
+            if detail:
+                douban_info = detail
 
         return douban_info
 

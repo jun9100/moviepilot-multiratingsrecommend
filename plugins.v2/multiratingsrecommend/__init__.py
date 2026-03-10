@@ -26,7 +26,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.1"
+    plugin_version = "0.6.2"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -127,6 +127,7 @@ class MultiRatingsRecommend(_PluginBase):
         self._tmdb_match_cache: Dict[Tuple[str, str, str], Optional[dict]] = {}
         self._imdb_rating_cache: Dict[str, Optional[float]] = {}
         self._douban_info_cache: Dict[Tuple[str, str, str], Optional[dict]] = {}
+        self._douban_web_rating_cache: Dict[str, Optional[float]] = {}
         self._imdb_blocked_until: float = 0
         self._imdb_block_reason: str = ""
         self._imdb_dataset_status: str = "未启用"
@@ -803,6 +804,15 @@ class MultiRatingsRecommend(_PluginBase):
                 "豆瓣识别",
             )
             info = self._prefer_douban_info(info, recognized_info)
+        if not info or self._extract_douban_rating(info) is None:
+            web_rating = await self._get_douban_web_rating_by_id(str(douban_id))
+            if web_rating is not None:
+                base = dict(info or {})
+                base["id"] = str(base.get("id") or douban_id)
+                rating = base.get("rating") if isinstance(base.get("rating"), dict) else {}
+                rating["value"] = web_rating
+                base["rating"] = rating
+                info = self._annotate_douban_info(base, "豆瓣网页")
         if (not info or self._extract_douban_rating(info) is None) and self._enable_external_douban:
             external_info = await self._get_external_douban_info_by_id(str(douban_id), media_type, media)
             info = self._prefer_douban_info(info, external_info)
@@ -810,6 +820,51 @@ class MultiRatingsRecommend(_PluginBase):
             info["id"] = str(douban_id)
         self._douban_info_cache[cache_key] = info
         return info
+
+    async def _get_douban_web_rating_by_id(self, douban_id: str) -> Optional[float]:
+        douban_id = str(douban_id or "").strip()
+        if not douban_id:
+            return None
+        if douban_id in self._douban_web_rating_cache:
+            return self._douban_web_rating_cache[douban_id]
+        url = f"https://movie.douban.com/subject/{douban_id}/"
+        try:
+            html = await AsyncRequestUtils(
+                timeout=8,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "referer": "https://movie.douban.com/",
+                },
+            ).get(url)
+            if not html:
+                self._douban_web_rating_cache[douban_id] = None
+                return None
+            rating = self._extract_douban_rating_from_html(html)
+            self._douban_web_rating_cache[douban_id] = rating
+            return rating
+        except Exception as err:
+            logger.warn(f"豆瓣网页评分获取失败：{douban_id} - {err}")
+            self._douban_web_rating_cache[douban_id] = None
+            return None
+
+    @classmethod
+    def _extract_douban_rating_from_html(cls, html: str) -> Optional[float]:
+        text = str(html or "")
+        patterns = (
+            r'property="v:average">\\s*([0-9]+(?:\\.[0-9]+)?)\\s*<',
+            r'"ratingValue"\\s*:\\s*"([0-9]+(?:\\.[0-9]+)?)"',
+            r'class="rating_num"[^>]*>\\s*([0-9]+(?:\\.[0-9]+)?)\\s*<',
+        )
+        for pattern in patterns:
+            matched = re.search(pattern, text, flags=re.IGNORECASE)
+            if matched:
+                return cls._normalize_rating(matched.group(1))
+        return None
 
     async def _match_douban_info(self, media: MediaInfo, imdb_id: Optional[str]) -> Optional[dict]:
         titles = self._candidate_titles(media)

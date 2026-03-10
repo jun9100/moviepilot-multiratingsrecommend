@@ -16,7 +16,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "TMDB多评分推荐"
     plugin_desc = "基于TMDB推荐补充IMDb和豆瓣评分，并把多评分写入卡片简介。"
     plugin_icon = "mdi-star-box-multiple-outline"
-    plugin_version = "0.1.0"
+    plugin_version = "0.1.1"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -330,8 +330,9 @@ class MultiRatingsRecommend(_PluginBase):
         cache_key = imdb_id or f"{media.title}:{media.year}:{media.season}:{media.type}"
         if cache_key in self._douban_info_cache:
             return self._douban_info_cache[cache_key]
+        douban_info = None
         try:
-            douban_info = await self.chain.async_match_doubaninfo(
+            matched_info = await self.chain.async_match_doubaninfo(
                 name=media.title or "",
                 imdbid=imdb_id,
                 mtype=media.type,
@@ -339,6 +340,17 @@ class MultiRatingsRecommend(_PluginBase):
                 season=media.season,
                 raise_exception=False,
             )
+            douban_id = matched_info.get("id") if matched_info else None
+            if douban_id:
+                douban_info = await self.chain.async_douban_info(
+                    doubanid=str(douban_id),
+                    mtype=media.type,
+                    raise_exception=False,
+                )
+                if douban_info and not douban_info.get("id"):
+                    douban_info["id"] = str(douban_id)
+            if not douban_info:
+                douban_info = matched_info
         except Exception as err:
             logger.warn(f"豆瓣评分补充失败：{media.title} - {err}")
             douban_info = None

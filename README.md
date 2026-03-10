@@ -25,6 +25,8 @@
 2. 安装插件 `MultiRatingsRecommend`。
 3. 在插件配置页启用插件，并按需填写 `OMDb API Key` 以启用 IMDb 评分补充。
 
+> 当前文档对应版本：`v0.1.1`
+
 ## 配置项
 
 - `enable`: 启用插件

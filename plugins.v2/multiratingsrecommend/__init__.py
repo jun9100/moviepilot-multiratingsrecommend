@@ -26,7 +26,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.0"
+    plugin_version = "0.6.1"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -496,6 +496,31 @@ class MultiRatingsRecommend(_PluginBase):
                 break
         return result
 
+    async def _async_call_system_method_excluding_self(self, method: str, *args, **kwargs):
+        result = None
+        modules = sorted(self.chain.modulemanager.get_running_modules(method), key=lambda module: module.get_priority())
+        for module in modules:
+            if module is self:
+                continue
+            func = getattr(module, method, None)
+            if not func:
+                continue
+            if self._is_empty(result):
+                if inspect.iscoroutinefunction(func):
+                    result = await func(*args, **kwargs)
+                else:
+                    result = await run_in_threadpool(func, *args, **kwargs)
+            elif isinstance(result, list):
+                if inspect.iscoroutinefunction(func):
+                    temp = await func(*args, **kwargs)
+                else:
+                    temp = await run_in_threadpool(func, *args, **kwargs)
+                if isinstance(temp, list):
+                    result.extend(temp)
+            else:
+                break
+        return result
+
     async def _build_result(self, medias: Optional[Sequence[MediaInfo]]) -> Tuple[MediaInfo, ...]:
         items = [self._clone_media(media) for media in (medias or [])]
         if not items:
@@ -766,6 +791,18 @@ class MultiRatingsRecommend(_PluginBase):
                     "内置详情",
                 )
                 self._douban_info_cache[fallback_key] = info
+        if not info or self._extract_douban_rating(info) is None:
+            recognized = await self._async_call_system_method_excluding_self(
+                "async_recognize_media",
+                doubanid=str(douban_id),
+                mtype=media_type,
+                cache=False,
+            )
+            recognized_info = self._annotate_douban_info(
+                getattr(recognized, "douban_info", None) if recognized else None,
+                "豆瓣识别",
+            )
+            info = self._prefer_douban_info(info, recognized_info)
         if (not info or self._extract_douban_rating(info) is None) and self._enable_external_douban:
             external_info = await self._get_external_douban_info_by_id(str(douban_id), media_type, media)
             info = self._prefer_douban_info(info, external_info)

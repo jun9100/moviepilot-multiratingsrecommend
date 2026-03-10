@@ -1,0 +1,15 @@
+{
+  "MultiRatingsRecommend": {
+    "name": "TMDB多评分推荐",
+    "description": "基于 TMDB 推荐补充 IMDb 和豆瓣评分，新增可直接在推荐页使用的多评分推荐源。",
+    "labels": "推荐,TMDB,IMDb,豆瓣",
+    "version": "0.1.0",
+    "icon": "Moviepilot_A.png",
+    "author": "jun9100",
+    "level": 1,
+    "release": false,
+    "history": {
+      "v0.1.0": "初始版本：新增 TMDB 流行趋势 / 热门电影 / 热门电视剧三条多评分推荐源，保留 TMDB 角标评分，并补充 IMDb 与豆瓣评分到详情简介。"
+    }
+  }
+}

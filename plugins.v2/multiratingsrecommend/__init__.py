@@ -1,7 +1,12 @@
 import asyncio
+import gzip
 import inspect
+import json
 import re
+import sqlite3
 import time
+from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi.concurrency import run_in_threadpool
@@ -20,7 +25,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.3.2"
+    plugin_version = "0.4.0"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -105,6 +110,8 @@ class MultiRatingsRecommend(_PluginBase):
         self._enabled = True
         self._enable_imdb = True
         self._enable_douban = True
+        self._imdb_source = "auto"
+        self._imdb_ratings_path = ""
         self._omdb_api_key = ""
         self._max_items = 30
         self._tmdb_api = TmdbApi()
@@ -115,6 +122,9 @@ class MultiRatingsRecommend(_PluginBase):
         self._douban_info_cache: Dict[Tuple[str, str, str], Optional[dict]] = {}
         self._imdb_blocked_until: float = 0
         self._imdb_block_reason: str = ""
+        self._imdb_dataset_status: str = "未启用"
+        self._imdb_dataset_meta: Dict[str, Any] = {}
+        self._imdb_dataset_lock = Lock()
 
     @staticmethod
     def _default_config() -> Dict[str, Any]:
@@ -122,6 +132,8 @@ class MultiRatingsRecommend(_PluginBase):
             "enable": True,
             "enable_imdb": True,
             "enable_douban": True,
+            "imdb_source": "auto",
+            "imdb_ratings_path": "",
             "omdb_api_key": "",
             "max_items": 30,
         }
@@ -132,12 +144,15 @@ class MultiRatingsRecommend(_PluginBase):
         self._enabled = bool(conf.get("enable"))
         self._enable_imdb = bool(conf.get("enable_imdb"))
         self._enable_douban = bool(conf.get("enable_douban"))
+        self._imdb_source = str(conf.get("imdb_source") or "auto").strip().lower()
+        self._imdb_ratings_path = str(conf.get("imdb_ratings_path") or "").strip()
         self._omdb_api_key = (conf.get("omdb_api_key") or "").strip()
         try:
             self._max_items = max(1, min(int(conf.get("max_items") or 30), 50))
         except (TypeError, ValueError):
             self._max_items = 30
         self._reset_runtime_cache()
+        self._refresh_imdb_dataset_status()
         self._trigger_recommend_cache_clear()
 
     def get_state(self) -> bool:
@@ -176,7 +191,7 @@ class MultiRatingsRecommend(_PluginBase):
                 "text": (
                     "插件会统一改写推荐页、搜索结果、媒体详情和工作流中的评分。"
                     "卡片右上角优先显示 TMDB / 豆瓣 的低分，两者都缺失时回退 IMDb；"
-                    "详情页会在简介上方显示各平台评分串。"
+                    "详情页会在简介上方显示各平台评分串。IMDb 支持本地数据集优先模式。"
                 ),
             },
             {
@@ -200,9 +215,36 @@ class MultiRatingsRecommend(_PluginBase):
                 "component": "VSwitch",
                 "props": {
                     "model": "enable_imdb",
-                    "label": "参与 IMDb 评分（需 OMDb API Key）",
+                    "label": "参与 IMDb 评分",
                     "class": "mb-2",
                     "disabled": "{{ !enable }}",
+                },
+            },
+            {
+                "component": "VSelect",
+                "props": {
+                    "model": "imdb_source",
+                    "label": "IMDb 数据来源",
+                    "items": [
+                        {"title": "本地数据集优先，OMDb 回退（推荐）", "value": "auto"},
+                        {"title": "仅本地数据集", "value": "dataset"},
+                        {"title": "仅 OMDb", "value": "omdb"},
+                    ],
+                    "item-title": "title",
+                    "item-value": "value",
+                    "class": "mb-2",
+                    "disabled": "{{ !enable || !enable_imdb }}",
+                },
+            },
+            {
+                "component": "VTextField",
+                "props": {
+                    "model": "imdb_ratings_path",
+                    "label": "IMDb title.ratings.tsv(.gz) 路径",
+                    "placeholder": "例如：/config/imdb/title.ratings.tsv.gz",
+                    "clearable": True,
+                    "class": "mb-2",
+                    "disabled": "{{ !enable || !enable_imdb || imdb_source === 'omdb' }}",
                 },
             },
             {
@@ -213,7 +255,7 @@ class MultiRatingsRecommend(_PluginBase):
                     "placeholder": "例如：your-omdb-key",
                     "clearable": True,
                     "class": "mb-2",
-                    "disabled": "{{ !enable || !enable_imdb }}",
+                    "disabled": "{{ !enable || !enable_imdb || imdb_source === 'dataset' }}",
                 },
             },
             {
@@ -242,9 +284,11 @@ class MultiRatingsRecommend(_PluginBase):
                     f"当前状态：{'已启用' if self._enabled else '未启用'}；"
                     f"豆瓣：{'参与计算' if self._enable_douban else '不参与'}；"
                     f"IMDb：{'参与计算' if self._enable_imdb else '不参与'}；"
+                    f"IMDb 来源：{self._imdb_source}；"
                     f"最大补分条数：{self._max_items}；"
                     f"主评分策略：TMDB / 豆瓣 取低分，缺失时回退 IMDb"
-                    + (f"；IMDb 状态：{self._imdb_block_reason}" if self._imdb_blocked_until > time.time() else "")
+                    + (f"；IMDb 数据集：{self._imdb_dataset_status}" if self._enable_imdb else "")
+                    + (f"；OMDb 状态：{self._imdb_block_reason}" if self._imdb_blocked_until > time.time() else "")
                 ),
             }
         ]
@@ -261,6 +305,8 @@ class MultiRatingsRecommend(_PluginBase):
         self._douban_info_cache.clear()
         self._imdb_blocked_until = 0
         self._imdb_block_reason = ""
+        self._imdb_dataset_meta = {}
+        self._imdb_dataset_status = "未启用"
 
     def _make_sync_item_handler(self, method: str):
         def handler(*args, **kwargs):
@@ -578,6 +624,12 @@ class MultiRatingsRecommend(_PluginBase):
         return info
 
     async def _get_imdb_rating(self, imdb_id: str) -> Optional[float]:
+        if self._imdb_source in {"auto", "dataset"}:
+            dataset_rating = await self._get_imdb_rating_from_dataset(imdb_id)
+            if dataset_rating is not None:
+                return dataset_rating
+            if self._imdb_source == "dataset":
+                return None
         if not self._omdb_api_key:
             return None
         if self._imdb_blocked_until > time.time():
@@ -602,6 +654,173 @@ class MultiRatingsRecommend(_PluginBase):
                 logger.warn(f"IMDb 评分接口已触发限额熔断：{error_message}")
         self._imdb_rating_cache[imdb_id] = rating
         return rating
+
+    async def _get_imdb_rating_from_dataset(self, imdb_id: str) -> Optional[float]:
+        if not imdb_id:
+            return None
+        if not self._imdb_ratings_path:
+            self._imdb_dataset_status = "未配置数据集路径"
+            return None
+        return await run_in_threadpool(self._lookup_imdb_rating_from_dataset, imdb_id)
+
+    def _lookup_imdb_rating_from_dataset(self, imdb_id: str) -> Optional[float]:
+        dataset_path = self._get_imdb_dataset_source_path()
+        if not dataset_path:
+            self._imdb_dataset_status = "数据集路径不存在"
+            return None
+        try:
+            db_path = self._ensure_imdb_dataset_index(dataset_path)
+            if not db_path or not db_path.exists():
+                self._imdb_dataset_status = "数据集索引不可用"
+                return None
+            with sqlite3.connect(db_path) as conn:
+                row = conn.execute(
+                    "SELECT average_rating FROM ratings WHERE imdb_id = ?",
+                    (imdb_id,),
+                ).fetchone()
+            if row:
+                return self._normalize_rating(row[0])
+            return None
+        except Exception as err:
+            self._imdb_dataset_status = f"索引失败：{err}"
+            logger.error(f"IMDb 数据集查询失败：{err}")
+            return None
+
+    def _refresh_imdb_dataset_status(self):
+        if not self._enable_imdb:
+            self._imdb_dataset_status = "未启用"
+            return
+        if self._imdb_source == "omdb":
+            self._imdb_dataset_status = "未使用"
+            return
+        source_path = self._get_imdb_dataset_source_path()
+        if not source_path:
+            self._imdb_dataset_status = "未配置数据集路径"
+            return
+        meta = self._load_imdb_dataset_meta()
+        if meta and self._is_imdb_dataset_meta_current(meta, source_path):
+            self._imdb_dataset_meta = meta
+            self._imdb_dataset_status = f"已索引 {meta.get('record_count', 0)} 条"
+        else:
+            self._imdb_dataset_status = "待建立索引"
+
+    def _get_imdb_dataset_source_path(self) -> Optional[Path]:
+        if not self._imdb_ratings_path:
+            return None
+        dataset_path = Path(self._imdb_ratings_path).expanduser()
+        if dataset_path.exists() and dataset_path.is_file():
+            return dataset_path
+        return None
+
+    def _get_imdb_dataset_db_path(self) -> Path:
+        return self.get_data_path() / "imdb_ratings.sqlite3"
+
+    def _get_imdb_dataset_meta_path(self) -> Path:
+        return self.get_data_path() / "imdb_ratings_meta.json"
+
+    def _load_imdb_dataset_meta(self) -> Dict[str, Any]:
+        meta_path = self._get_imdb_dataset_meta_path()
+        if not meta_path.exists():
+            return {}
+        try:
+            return json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save_imdb_dataset_meta(self, meta: Dict[str, Any]):
+        self._get_imdb_dataset_meta_path().write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _is_imdb_dataset_meta_current(meta: Dict[str, Any], source_path: Path) -> bool:
+        try:
+            stat = source_path.stat()
+        except FileNotFoundError:
+            return False
+        return (
+            meta.get("source_path") == str(source_path)
+            and meta.get("source_size") == stat.st_size
+            and meta.get("source_mtime_ns") == stat.st_mtime_ns
+        )
+
+    def _ensure_imdb_dataset_index(self, source_path: Path) -> Path:
+        with self._imdb_dataset_lock:
+            db_path = self._get_imdb_dataset_db_path()
+            meta = self._load_imdb_dataset_meta()
+            if db_path.exists() and meta and self._is_imdb_dataset_meta_current(meta, source_path):
+                self._imdb_dataset_meta = meta
+                self._imdb_dataset_status = f"已索引 {meta.get('record_count', 0)} 条"
+                return db_path
+            self._build_imdb_dataset_index(source_path, db_path)
+            meta = self._load_imdb_dataset_meta()
+            self._imdb_dataset_meta = meta
+            self._imdb_dataset_status = f"已索引 {meta.get('record_count', 0)} 条"
+            return db_path
+
+    def _build_imdb_dataset_index(self, source_path: Path, db_path: Path):
+        self._imdb_dataset_status = "正在建立索引"
+        tmp_path = db_path.with_suffix(".tmp.sqlite3")
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+        record_count = 0
+        with sqlite3.connect(tmp_path) as conn:
+            conn.execute("PRAGMA journal_mode=MEMORY")
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute(
+                "CREATE TABLE ratings (imdb_id TEXT PRIMARY KEY, average_rating REAL NOT NULL, num_votes INTEGER NOT NULL)"
+            )
+            batch: List[Tuple[str, float, int]] = []
+            with self._open_imdb_dataset(source_path) as handle:
+                next(handle, None)
+                for line in handle:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) < 3:
+                        continue
+                    imdb_id = parts[0].strip()
+                    rating = self._normalize_rating(parts[1].strip())
+                    if not imdb_id or rating is None:
+                        continue
+                    try:
+                        num_votes = int(parts[2].strip() or 0)
+                    except ValueError:
+                        num_votes = 0
+                    batch.append((imdb_id, rating, num_votes))
+                    if len(batch) >= 20000:
+                        conn.executemany(
+                            "INSERT OR REPLACE INTO ratings (imdb_id, average_rating, num_votes) VALUES (?, ?, ?)",
+                            batch,
+                        )
+                        record_count += len(batch)
+                        batch.clear()
+                if batch:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO ratings (imdb_id, average_rating, num_votes) VALUES (?, ?, ?)",
+                        batch,
+                    )
+                    record_count += len(batch)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ratings_votes ON ratings (num_votes DESC)")
+            conn.commit()
+
+        tmp_path.replace(db_path)
+        stat = source_path.stat()
+        self._save_imdb_dataset_meta(
+            {
+                "source_path": str(source_path),
+                "source_size": stat.st_size,
+                "source_mtime_ns": stat.st_mtime_ns,
+                "record_count": record_count,
+                "built_at": int(time.time()),
+            }
+        )
+
+    @staticmethod
+    def _open_imdb_dataset(source_path: Path):
+        if source_path.suffix.lower() == ".gz":
+            return gzip.open(source_path, "rt", encoding="utf-8", newline="")
+        return source_path.open("r", encoding="utf-8", newline="")
 
     @staticmethod
     def _clone_media(media: MediaInfo) -> MediaInfo:

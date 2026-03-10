@@ -33,13 +33,15 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 2. 安装插件 `MultiRatingsRecommend`。
 3. 在插件配置页启用插件，并按需填写 `OMDb API Key` 以启用 IMDb 评分。
 
-> 当前文档对应版本：`v0.3.2`
+> 当前文档对应版本：`v0.4.0`
 
 ## 配置项
 
 - `enable`: 启用插件
 - `enable_douban`: 是否让豆瓣参与主评分计算
 - `enable_imdb`: 是否启用 IMDb 回退评分
+- `imdb_source`: IMDb 数据来源，可选 `auto / dataset / omdb`
+- `imdb_ratings_path`: IMDb 官方 `title.ratings.tsv` 或 `title.ratings.tsv.gz` 的本地路径
 - `omdb_api_key`: OMDb API Key
 - `max_items`: 每次列表接口最大补分条数
 
@@ -50,8 +52,34 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 - 豆瓣榜单、豆瓣搜索结果会额外尝试做 TMDB 匹配，尽量避免点击条目后落到空详情页。
 - 如果没有拿到 `TMDB / 豆瓣`，会自动回退到 `IMDb`；再缺失时才使用 `Bangumi`。
 - IMDb 外部接口触发额度限制后，插件会自动熔断 12 小时，避免持续请求。
+- 如果配置了 IMDb 官方数据集路径，插件会自动在插件数据目录生成本地 SQLite 索引，后续优先本地查分。
 
 ## 说明
 
 - 插件升级或配置变化时，会自动清理推荐缓存，避免页面继续显示旧分数。
 - 由于需要做跨平台匹配，首次打开新列表时会比原生 TMDB / 豆瓣稍慢。
+
+## IMDb 官方数据集模式
+
+适合自用私有部署。
+
+1. 从 IMDb 官方下载 `title.ratings.tsv.gz`
+2. 把文件挂载到 MoviePilot 容器可访问的位置
+3. 在插件配置中设置：
+   - `IMDb 数据来源 = 本地数据集优先，OMDb 回退（推荐）`
+   - `IMDb title.ratings.tsv(.gz) 路径 = 容器内实际路径`
+
+示例挂载：
+
+```yaml
+volumes:
+  - /data/imdb/title.ratings.tsv.gz:/config/imdb/title.ratings.tsv.gz:ro
+```
+
+示例配置路径：
+
+```text
+/config/imdb/title.ratings.tsv.gz
+```
+
+插件会自动在自身数据目录建立本地 SQLite 索引，无需手工预处理。

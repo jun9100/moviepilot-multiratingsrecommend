@@ -31,9 +31,9 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 
 1. 在 MoviePilot 中通过插件仓库地址安装本仓库。
 2. 安装插件 `MultiRatingsRecommend`。
-3. 在插件配置页启用插件，并按需填写 `OMDb API Key` 以启用 IMDb 评分。
+3. 在插件配置页启用插件，并按需填写 `OMDb API Key` 或 IMDb 官方数据集路径。
 
-> 当前文档对应版本：`v0.4.1`
+> 当前文档对应版本：`v0.5.0`
 
 ## 配置项
 
@@ -45,6 +45,16 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 - `omdb_api_key`: OMDb API Key
 - `max_items`: 每次列表接口最大补分条数
 
+## 新增能力
+
+- 列表补分已增加并发限制，避免一次性打爆外部评分源。
+- IMDb 官方数据集支持后台自动建索引。
+- 新增插件 API：
+  - `GET /api/v1/plugin/MultiRatingsRecommend/imdb/status`
+  - `POST /api/v1/plugin/MultiRatingsRecommend/imdb/rebuild`
+- OMDb 限额熔断状态会持久化保存，容器重启后不会马上重新打满额度。
+- 豆瓣匹配不再只用单一标题，会同时尝试中文名、原标题、英文名和别名。
+
 ## 展示说明
 
 - 推荐页、搜索页、工作流中的评分过滤都基于改写后的 `vote_average`。
@@ -52,7 +62,9 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 - 豆瓣榜单、豆瓣搜索结果会额外尝试做 TMDB 匹配，尽量避免点击条目后落到空详情页。
 - 如果没有拿到 `TMDB / 豆瓣`，会自动回退到 `IMDb`；再缺失时才使用 `Bangumi`。
 - IMDb 外部接口触发额度限制后，插件会自动熔断 12 小时，避免持续请求。
+- OMDb 熔断状态会持久化保存，直到过期后才自动恢复。
 - 如果配置了 IMDb 官方数据集路径，插件会自动在插件数据目录生成本地 SQLite 索引，后续优先本地查分。
+- 如果数据集还没建立好索引，插件会先在后台建索引，不阻塞页面请求。
 
 ## 说明
 
@@ -82,4 +94,10 @@ volumes:
 /config/imdb/title.ratings.tsv.gz
 ```
 
-插件会自动在自身数据目录建立本地 SQLite 索引，无需手工预处理。
+插件会自动在自身数据目录建立本地 SQLite 索引，无需手工预处理。也可以通过插件 API 主动触发重建：
+
+```bash
+curl -X POST \
+  -H 'X-Api-Key: <MP_API_KEY>' \
+  http://<MP_HOST>/api/v1/plugin/MultiRatingsRecommend/imdb/rebuild
+```

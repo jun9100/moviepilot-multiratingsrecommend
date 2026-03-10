@@ -6,7 +6,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi.concurrency import run_in_threadpool
@@ -25,7 +25,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.4.1"
+    plugin_version = "0.5.0"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -95,6 +95,8 @@ class MultiRatingsRecommend(_PluginBase):
         "IMDb": 2,
         "Bangumi": 3,
     }
+    _LIST_ENRICH_CONCURRENCY = 6
+    _OMDB_BLOCK_STATE_KEY = "omdb_block_state"
     _OVERVIEW_PREFIXES = (
         "当前分：",
         "全部评分：",
@@ -125,6 +127,9 @@ class MultiRatingsRecommend(_PluginBase):
         self._imdb_dataset_status: str = "未启用"
         self._imdb_dataset_meta: Dict[str, Any] = {}
         self._imdb_dataset_lock = Lock()
+        self._imdb_dataset_building = False
+        self._imdb_dataset_build_thread: Optional[Thread] = None
+        self._imdb_dataset_build_error = ""
 
     @staticmethod
     def _default_config() -> Dict[str, Any]:
@@ -156,7 +161,9 @@ class MultiRatingsRecommend(_PluginBase):
         except (TypeError, ValueError):
             self._max_items = 30
         self._reset_runtime_cache()
+        self._load_omdb_block_state()
         self._refresh_imdb_dataset_status()
+        self._schedule_imdb_dataset_index_build()
         self._trigger_recommend_cache_clear()
 
     def get_state(self) -> bool:
@@ -167,7 +174,23 @@ class MultiRatingsRecommend(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        plugin_id = self.__class__.__name__
+        return [
+            {
+                "path": f"/{plugin_id}/imdb/status",
+                "endpoint": self.api_imdb_status,
+                "methods": ["GET"],
+                "summary": "获取 IMDb 数据集状态",
+                "description": "返回 IMDb 数据集索引和 OMDb 熔断状态",
+            },
+            {
+                "path": f"/{plugin_id}/imdb/rebuild",
+                "endpoint": self.api_imdb_rebuild,
+                "methods": ["POST"],
+                "summary": "重建 IMDb 数据集索引",
+                "description": "后台重建 IMDb title.ratings 数据集索引",
+            },
+        ]
 
     def get_module(self) -> Dict[str, Any]:
         if not self.get_state():
@@ -290,12 +313,24 @@ class MultiRatingsRecommend(_PluginBase):
                     f"IMDb：{'参与计算' if self._enable_imdb else '不参与'}；"
                     f"IMDb 来源：{self._imdb_source}；"
                     f"最大补分条数：{self._max_items}；"
+                    f"列表并发：{self._LIST_ENRICH_CONCURRENCY}；"
                     f"主评分策略：TMDB / 豆瓣 取低分，缺失时回退 IMDb"
                     + (f"；IMDb 数据集：{self._imdb_dataset_status}" if self._enable_imdb else "")
                     + (f"；OMDb 状态：{self._imdb_block_reason}" if self._imdb_blocked_until > time.time() else "")
                 ),
             }
         ]
+
+    def api_imdb_status(self) -> Dict[str, Any]:
+        return self._get_imdb_status_payload()
+
+    def api_imdb_rebuild(self) -> Dict[str, Any]:
+        started = self._schedule_imdb_dataset_index_build(force=True)
+        return {
+            "success": started or self._imdb_dataset_building,
+            "started": started,
+            "status": self._get_imdb_status_payload(),
+        }
 
     def stop_service(self):
         self._reset_runtime_cache()
@@ -311,6 +346,9 @@ class MultiRatingsRecommend(_PluginBase):
         self._imdb_block_reason = ""
         self._imdb_dataset_meta = {}
         self._imdb_dataset_status = "未启用"
+        self._imdb_dataset_building = False
+        self._imdb_dataset_build_thread = None
+        self._imdb_dataset_build_error = ""
 
     def _make_sync_item_handler(self, method: str):
         def handler(*args, **kwargs):
@@ -402,7 +440,13 @@ class MultiRatingsRecommend(_PluginBase):
             return ()
         target_count = min(self._max_items, len(items))
         if target_count:
-            enriched_items = await asyncio.gather(*(self._enrich_media(items[index]) for index in range(target_count)))
+            semaphore = asyncio.Semaphore(min(self._LIST_ENRICH_CONCURRENCY, target_count))
+
+            async def _enrich_with_limit(index: int) -> MediaInfo:
+                async with semaphore:
+                    return await self._enrich_media(items[index])
+
+            enriched_items = await asyncio.gather(*(_enrich_with_limit(index) for index in range(target_count)))
             items[:target_count] = enriched_items
         for index in range(target_count, len(items)):
             items[index].overview = self._strip_rating_overview(items[index].overview)
@@ -410,6 +454,7 @@ class MultiRatingsRecommend(_PluginBase):
 
     async def _enrich_media(self, media: MediaInfo) -> MediaInfo:
         media.overview = self._strip_rating_overview(media.overview)
+        media.tagline = ""
 
         ratings: Dict[str, float] = {}
         source_label = self._source_label(media)
@@ -506,16 +551,29 @@ class MultiRatingsRecommend(_PluginBase):
 
     async def _resolve_douban_info(self, media: MediaInfo) -> Optional[dict]:
         media_type = self._get_media_type(media.type)
-        if media.douban_id:
-            return await self._get_douban_info_by_id(media.douban_id, media_type)
-
         douban_info = None
+        if media.douban_id:
+            douban_info = await self._get_douban_info_by_id(media.douban_id, media_type)
+            if douban_info and self._extract_douban_rating(douban_info) is not None:
+                return douban_info
+
         if media.tmdb_id:
-            douban_info = await self._get_doubaninfo_by_tmdbid(media.tmdb_id, media_type)
+            douban_info = self._prefer_douban_info(
+                douban_info,
+                await self._get_doubaninfo_by_tmdbid(media.tmdb_id, media_type),
+            )
         elif media.bangumi_id:
-            douban_info = await self._get_doubaninfo_by_bangumiid(media.bangumi_id)
-        if not douban_info and (media.imdb_id or media.title):
-            douban_info = await self._match_douban_info(media, media.imdb_id)
+            douban_info = self._prefer_douban_info(
+                douban_info,
+                await self._get_doubaninfo_by_bangumiid(media.bangumi_id),
+            )
+        if (not douban_info or self._extract_douban_rating(douban_info) is None) and (
+            media.imdb_id or self._candidate_titles(media)
+        ):
+            douban_info = self._prefer_douban_info(
+                douban_info,
+                await self._match_douban_info(media, media.imdb_id),
+            )
         douban_id = douban_info.get("id") if douban_info else None
         if douban_id and self._extract_douban_rating(douban_info) is None:
             detail = await self._get_douban_info_by_id(str(douban_id), media_type)
@@ -554,10 +612,7 @@ class MultiRatingsRecommend(_PluginBase):
         media_type = self._get_media_type(media.type)
         if not media_type:
             return None
-        names = []
-        for value in [media.original_title, media.title, media.en_title, *(media.names or [])]:
-            if value and value not in names:
-                names.append(value)
+        names = self._candidate_titles(media)
         if not names:
             return None
         cache_key = ("title", "|".join(names), str(media.year or ""), media_type.value)
@@ -597,40 +652,67 @@ class MultiRatingsRecommend(_PluginBase):
         if cache_key in self._douban_info_cache:
             return self._douban_info_cache[cache_key]
         info = await self.chain.async_douban_info(doubanid=str(douban_id), mtype=media_type, raise_exception=False)
+        if not info and media_type:
+            fallback_key = ("id", str(douban_id), "")
+            if fallback_key in self._douban_info_cache:
+                info = self._douban_info_cache[fallback_key]
+            else:
+                info = await self.chain.async_douban_info(doubanid=str(douban_id), mtype=None, raise_exception=False)
+                self._douban_info_cache[fallback_key] = info
+        if info and not info.get("id"):
+            info["id"] = str(douban_id)
         self._douban_info_cache[cache_key] = info
         return info
 
     async def _match_douban_info(self, media: MediaInfo, imdb_id: Optional[str]) -> Optional[dict]:
-        cache_key = ("match", imdb_id or media.title or "", str(media.year or ""))
+        titles = self._candidate_titles(media)
+        cache_key = (
+            "match",
+            imdb_id or "",
+            "|".join(titles),
+            str(media.year or ""),
+            str(media.season or ""),
+            self._get_media_type(media.type).value if self._get_media_type(media.type) else "",
+        )
         if cache_key in self._douban_info_cache:
             return self._douban_info_cache[cache_key]
         info = None
-        try:
-            info = await self.chain.async_match_doubaninfo(
-                name=media.title or "",
-                imdbid=imdb_id,
-                mtype=self._get_media_type(media.type),
-                year=media.year,
-                season=media.season,
-                raise_exception=False,
-            )
-            douban_id = info.get("id") if info else None
-            if douban_id:
-                detail = await self._get_douban_info_by_id(str(douban_id), self._get_media_type(media.type))
-                if detail:
-                    if not detail.get("id"):
-                        detail["id"] = str(douban_id)
-                    info = detail
-        except Exception as err:
-            logger.warn(f"豆瓣评分补充失败：{media.title} - {err}")
-            info = None
+        for title in titles or [media.title or ""]:
+            try:
+                matched = await self.chain.async_match_doubaninfo(
+                    name=title or "",
+                    imdbid=imdb_id,
+                    mtype=self._get_media_type(media.type),
+                    year=media.year,
+                    season=media.season,
+                    raise_exception=False,
+                )
+                douban_id = matched.get("id") if matched else None
+                if douban_id:
+                    detail = await self._get_douban_info_by_id(str(douban_id), self._get_media_type(media.type))
+                    if detail:
+                        if not detail.get("id"):
+                            detail["id"] = str(douban_id)
+                        matched = detail
+                info = self._prefer_douban_info(info, matched)
+                if info and self._extract_douban_rating(info) is not None:
+                    break
+            except Exception as err:
+                logger.warn(f"豆瓣评分补充失败：{title or media.title} - {err}")
         self._douban_info_cache[cache_key] = info
         return info
 
     async def _get_imdb_rating(self, imdb_id: str) -> Optional[float]:
+        if not imdb_id:
+            return None
+        if self._imdb_blocked_until and self._imdb_blocked_until <= time.time():
+            self._clear_omdb_block_state()
+        if imdb_id in self._imdb_rating_cache:
+            return self._imdb_rating_cache[imdb_id]
         if self._imdb_source in {"auto", "dataset"}:
             dataset_rating = await self._get_imdb_rating_from_dataset(imdb_id)
             if dataset_rating is not None:
+                self._imdb_rating_cache[imdb_id] = dataset_rating
                 return dataset_rating
             if self._imdb_source == "dataset":
                 return None
@@ -638,8 +720,6 @@ class MultiRatingsRecommend(_PluginBase):
             return None
         if self._imdb_blocked_until > time.time():
             return None
-        if imdb_id in self._imdb_rating_cache:
-            return self._imdb_rating_cache[imdb_id]
         data = await AsyncRequestUtils(timeout=10).get_json(
             "https://www.omdbapi.com/",
             params={
@@ -653,8 +733,7 @@ class MultiRatingsRecommend(_PluginBase):
         elif data and data.get("Error"):
             error_message = str(data.get("Error"))
             if "limit" in error_message.lower():
-                self._imdb_blocked_until = time.time() + 12 * 3600
-                self._imdb_block_reason = error_message
+                self._set_omdb_block_state(time.time() + 12 * 3600, error_message)
                 logger.warn(f"IMDb 评分接口已触发限额熔断：{error_message}")
         self._imdb_rating_cache[imdb_id] = rating
         return rating
@@ -662,6 +741,8 @@ class MultiRatingsRecommend(_PluginBase):
     async def _get_imdb_rating_from_dataset(self, imdb_id: str) -> Optional[float]:
         if not imdb_id:
             return None
+        if imdb_id in self._imdb_rating_cache:
+            return self._imdb_rating_cache[imdb_id]
         if not self._imdb_ratings_path:
             self._imdb_dataset_status = "未配置数据集路径"
             return None
@@ -673,7 +754,16 @@ class MultiRatingsRecommend(_PluginBase):
             self._imdb_dataset_status = "数据集路径不存在"
             return None
         try:
-            db_path = self._ensure_imdb_dataset_index(dataset_path)
+            db_path = self._get_imdb_dataset_db_path()
+            meta = self._load_imdb_dataset_meta()
+            if db_path.exists() and meta and self._is_imdb_dataset_meta_current(meta, dataset_path):
+                self._imdb_dataset_meta = meta
+                self._imdb_dataset_status = f"已索引 {meta.get('record_count', 0)} 条"
+            else:
+                if self._imdb_dataset_building:
+                    self._imdb_dataset_status = "正在建立索引"
+                    return None
+                db_path = self._ensure_imdb_dataset_index(dataset_path)
             if not db_path or not db_path.exists():
                 self._imdb_dataset_status = "数据集索引不可用"
                 return None
@@ -683,7 +773,9 @@ class MultiRatingsRecommend(_PluginBase):
                     (imdb_id,),
                 ).fetchone()
             if row:
-                return self._normalize_rating(row[0])
+                rating = self._normalize_rating(row[0])
+                self._imdb_rating_cache[imdb_id] = rating
+                return rating
             return None
         except Exception as err:
             self._imdb_dataset_status = f"索引失败：{err}"
@@ -707,6 +799,44 @@ class MultiRatingsRecommend(_PluginBase):
             self._imdb_dataset_status = f"已索引 {meta.get('record_count', 0)} 条"
         else:
             self._imdb_dataset_status = "待建立索引"
+
+    def _schedule_imdb_dataset_index_build(self, force: bool = False) -> bool:
+        if not self._enable_imdb or self._imdb_source == "omdb":
+            return False
+        source_path = self._get_imdb_dataset_source_path()
+        if not source_path:
+            return False
+        meta = self._load_imdb_dataset_meta()
+        if not force and meta and self._is_imdb_dataset_meta_current(meta, source_path):
+            self._imdb_dataset_meta = meta
+            self._imdb_dataset_status = f"已索引 {meta.get('record_count', 0)} 条"
+            return False
+        if self._imdb_dataset_building and self._imdb_dataset_build_thread and self._imdb_dataset_build_thread.is_alive():
+            return False
+        self._imdb_dataset_building = True
+        self._imdb_dataset_build_error = ""
+        self._imdb_dataset_status = "正在建立索引"
+        thread = Thread(
+            target=self._run_imdb_dataset_index_build,
+            args=(source_path, force),
+            daemon=True,
+            name="mp-imdb-index",
+        )
+        self._imdb_dataset_build_thread = thread
+        thread.start()
+        return True
+
+    def _run_imdb_dataset_index_build(self, source_path: Path, force: bool):
+        try:
+            self._ensure_imdb_dataset_index(source_path, force=force)
+        except Exception as err:
+            self._imdb_dataset_build_error = str(err)
+            self._imdb_dataset_status = f"索引失败：{err}"
+            logger.error(f"IMDb 数据集后台建索引失败：{err}")
+        finally:
+            self._imdb_dataset_building = False
+            if not self._imdb_dataset_build_error:
+                self._refresh_imdb_dataset_status()
 
     def _get_imdb_dataset_source_path(self) -> Optional[Path]:
         if not self._imdb_ratings_path:
@@ -737,6 +867,48 @@ class MultiRatingsRecommend(_PluginBase):
             encoding="utf-8",
         )
 
+    def _load_omdb_block_state(self):
+        data = self.get_data(self._OMDB_BLOCK_STATE_KEY) or {}
+        blocked_until = float(data.get("blocked_until") or 0)
+        if blocked_until > time.time():
+            self._imdb_blocked_until = blocked_until
+            self._imdb_block_reason = str(data.get("reason") or "")
+        else:
+            self._clear_omdb_block_state()
+
+    def _set_omdb_block_state(self, blocked_until: float, reason: str):
+        self._imdb_blocked_until = blocked_until
+        self._imdb_block_reason = str(reason or "")
+        self.save_data(
+            self._OMDB_BLOCK_STATE_KEY,
+            {
+                "blocked_until": blocked_until,
+                "reason": self._imdb_block_reason,
+            },
+        )
+
+    def _clear_omdb_block_state(self):
+        self._imdb_blocked_until = 0
+        self._imdb_block_reason = ""
+        self.del_data(self._OMDB_BLOCK_STATE_KEY)
+
+    def _get_imdb_status_payload(self) -> Dict[str, Any]:
+        built_at = self._imdb_dataset_meta.get("built_at")
+        return {
+            "enabled": self._enabled,
+            "imdb_enabled": self._enable_imdb,
+            "imdb_source": self._imdb_source,
+            "dataset_path": self._imdb_ratings_path,
+            "dataset_status": self._imdb_dataset_status,
+            "dataset_building": self._imdb_dataset_building,
+            "dataset_error": self._imdb_dataset_build_error,
+            "dataset_record_count": self._imdb_dataset_meta.get("record_count", 0),
+            "dataset_built_at": built_at,
+            "omdb_blocked": self._imdb_blocked_until > time.time(),
+            "omdb_blocked_until": int(self._imdb_blocked_until) if self._imdb_blocked_until else 0,
+            "omdb_block_reason": self._imdb_block_reason,
+        }
+
     @staticmethod
     def _is_imdb_dataset_meta_current(meta: Dict[str, Any], source_path: Path) -> bool:
         try:
@@ -749,11 +921,11 @@ class MultiRatingsRecommend(_PluginBase):
             and meta.get("source_mtime_ns") == stat.st_mtime_ns
         )
 
-    def _ensure_imdb_dataset_index(self, source_path: Path) -> Path:
+    def _ensure_imdb_dataset_index(self, source_path: Path, force: bool = False) -> Path:
         with self._imdb_dataset_lock:
             db_path = self._get_imdb_dataset_db_path()
             meta = self._load_imdb_dataset_meta()
-            if db_path.exists() and meta and self._is_imdb_dataset_meta_current(meta, source_path):
+            if not force and db_path.exists() and meta and self._is_imdb_dataset_meta_current(meta, source_path):
                 self._imdb_dataset_meta = meta
                 self._imdb_dataset_status = f"已索引 {meta.get('record_count', 0)} 条"
                 return db_path
@@ -849,6 +1021,38 @@ class MultiRatingsRecommend(_PluginBase):
         if normalized <= 0:
             return None
         return normalized
+
+    @staticmethod
+    def _candidate_titles(media: MediaInfo) -> List[str]:
+        names: List[str] = []
+        for value in [media.title, media.original_title, media.en_title, *(media.names or [])]:
+            title = str(value or "").strip()
+            if not title:
+                continue
+            if title not in names:
+                names.append(title)
+            title_no_season = re.sub(r"(?:第\s*[一二三四五六七八九十0-9]+\s*季|season\s*\d+)$", "", title, flags=re.I).strip()
+            if title_no_season and title_no_season not in names:
+                names.append(title_no_season)
+        return names
+
+    @classmethod
+    def _prefer_douban_info(cls, current: Optional[dict], candidate: Optional[dict]) -> Optional[dict]:
+        if not candidate:
+            return current
+        if not current:
+            return candidate
+        current_has_rating = cls._extract_douban_rating(current) is not None
+        candidate_has_rating = cls._extract_douban_rating(candidate) is not None
+        if candidate_has_rating and not current_has_rating:
+            return candidate
+        if current_has_rating and not candidate_has_rating:
+            return current
+        current_size = sum(1 for value in current.values() if value)
+        candidate_size = sum(1 for value in candidate.values() if value)
+        if candidate_size > current_size:
+            return candidate
+        return current
 
     @classmethod
     def _label_priority(cls, label: str) -> int:

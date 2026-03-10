@@ -417,7 +417,7 @@ class MultiRatingsRecommend(_PluginBase):
             douban_info = await self._get_doubaninfo_by_tmdbid(media.tmdb_id, media_type)
         elif media.bangumi_id:
             douban_info = await self._get_doubaninfo_by_bangumiid(media.bangumi_id)
-        elif media.imdb_id or media.title:
+        if not douban_info and (media.imdb_id or media.title):
             douban_info = await self._match_douban_info(media, media.imdb_id)
 
         return douban_info

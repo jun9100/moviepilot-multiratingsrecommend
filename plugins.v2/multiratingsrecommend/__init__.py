@@ -26,7 +26,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.5"
+    plugin_version = "0.6.6"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -138,6 +138,7 @@ class MultiRatingsRecommend(_PluginBase):
         self._imdb_ratings_path = ""
         self._omdb_api_key = ""
         self._max_items = 30
+        self._list_enrich_timeout = 6.0
         self._tmdb_api = TmdbApi()
         self._media_chain = MediaChain()
         self._tmdb_detail_cache: Dict[Tuple[str, int], Optional[dict]] = {}
@@ -181,6 +182,7 @@ class MultiRatingsRecommend(_PluginBase):
             "imdb_ratings_path": "",
             "omdb_api_key": "",
             "max_items": 30,
+            "list_enrich_timeout": 6,
         }
 
     def init_plugin(self, config: dict = None):
@@ -210,6 +212,10 @@ class MultiRatingsRecommend(_PluginBase):
             self._max_items = max(1, min(int(conf.get("max_items") or 30), 50))
         except (TypeError, ValueError):
             self._max_items = 30
+        try:
+            self._list_enrich_timeout = max(1.0, min(float(conf.get("list_enrich_timeout") or 6), 20.0))
+        except (TypeError, ValueError):
+            self._list_enrich_timeout = 6.0
         self._reset_runtime_cache()
         self._load_douban_block_state()
         self._load_douban_rating_store()
@@ -419,6 +425,20 @@ class MultiRatingsRecommend(_PluginBase):
                 },
             },
             {
+                "component": "VTextField",
+                "props": {
+                    "model": "list_enrich_timeout",
+                    "label": "列表补分单条超时秒数",
+                    "type": "number",
+                    "min": 1,
+                    "max": 20,
+                    "class": "mb-2",
+                    "disabled": "{{ !enable }}",
+                    "hint": "超时自动降级为原始评分，避免整行卡住",
+                    "persistent-hint": True,
+                },
+            },
+            {
                 "component": "VSwitch",
                 "props": {
                     "model": "enable_diagnostics",
@@ -445,6 +465,7 @@ class MultiRatingsRecommend(_PluginBase):
                     f"IMDb：{'参与计算' if self._enable_imdb else '不参与'}；"
                     f"IMDb 来源：{self._imdb_source}；"
                     f"最大补分条数：{self._max_items}；"
+                    f"单条超时：{self._list_enrich_timeout:.1f}s；"
                     f"列表并发：{self._LIST_ENRICH_CONCURRENCY}；"
                     f"主评分策略：TMDB / 豆瓣 取低分，缺失时回退 IMDb"
                     + (f"；豆瓣状态：{self._douban_block_reason}" if self._douban_blocked_until > time.time() else "")
@@ -633,7 +654,19 @@ class MultiRatingsRecommend(_PluginBase):
 
             async def _enrich_with_limit(index: int) -> MediaInfo:
                 async with semaphore:
-                    return await self._enrich_media(items[index], enrich_context="list")
+                    original = items[index]
+                    try:
+                        return await asyncio.wait_for(
+                            self._enrich_media(original, enrich_context="list"),
+                            timeout=self._list_enrich_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warn(f"列表补分超时，降级原始评分：{original.title or original.tmdb_id or index}")
+                    except Exception as err:
+                        logger.warn(f"列表补分失败，降级原始评分：{original.title or original.tmdb_id or index} - {err}")
+                    original.overview = self._strip_rating_overview(original.overview)
+                    original.tagline = ""
+                    return original
 
             enriched_items = await asyncio.gather(*(_enrich_with_limit(index) for index in range(target_count)))
             items[:target_count] = enriched_items

@@ -33,7 +33,7 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 2. 安装插件 `MultiRatingsRecommend`。
 3. 在插件配置页启用插件，并按需填写 `OMDb API Key` 或 IMDb 官方数据集路径。
 
-> 当前文档对应版本：`v0.6.5`
+> 当前文档对应版本：`v0.6.6`
 
 ## 配置项
 
@@ -51,6 +51,7 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 - `imdb_ratings_path`: IMDb 官方 `title.ratings.tsv` 或 `title.ratings.tsv.gz` 的本地路径
 - `omdb_api_key`: OMDb API Key
 - `max_items`: 每次列表接口最大补分条数
+- `list_enrich_timeout`: 列表补分单条超时秒数（超时自动降级为原始评分）
 
 ## 新增能力
 
@@ -61,6 +62,7 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 - 豆瓣请求新增风控保护：自动限速；命中 `error code:004`/`sec.douban.com` 后自动熔断 6 小时，避免继续触发风控。
 - 已命中的豆瓣评分会持久化到插件本地缓存；风控期间会优先回读本地缓存，并继续尝试外部豆瓣 API（如果已配置）。
 - 新增网页兜底精细控制：可整体验证关闭、可限制仅详情页触发、可限制每日网页请求上限。
+- 列表补分增加单条超时保护，避免某些外部评分链路慢/阻塞导致整行骨架屏长期不消失。
 - 插件页支持补分诊断模式，可直接查看最近的评分命中来源和失败原因。
 - 新增插件 API：
   - `GET /api/v1/plugin/MultiRatingsRecommend/imdb/status`

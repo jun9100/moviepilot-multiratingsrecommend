@@ -26,7 +26,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.6"
+    plugin_version = "0.6.7"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -104,6 +104,21 @@ class MultiRatingsRecommend(_PluginBase):
     _DOUBAN_BLOCK_HOURS = 6
     _DOUBAN_MIN_INTERVAL_SECONDS = 1.2
     _DOUBAN_RATING_STORE_LIMIT = 5000
+    _LIST_RESULT_CACHE_MAX_ENTRIES = 120
+    _PREWARM_LIST_METHODS = (
+        "tmdb_trending",
+        "movie_showing",
+        "douban_discover",
+        "movie_top250",
+        "tv_weekly_chinese",
+        "tv_weekly_global",
+        "tv_animation",
+        "movie_hot",
+        "tv_hot",
+        "bangumi_calendar",
+        "bangumi_discover",
+        "bangumi_recommend",
+    )
     _DOUBAN_BLOCK_MARKERS = (
         "error code: 004",
         "sec.douban.com",
@@ -139,6 +154,11 @@ class MultiRatingsRecommend(_PluginBase):
         self._omdb_api_key = ""
         self._max_items = 30
         self._list_enrich_timeout = 6.0
+        self._item_enrich_timeout = 8.0
+        self._enable_list_result_cache = True
+        self._list_cache_ttl_seconds = 900
+        self._prewarm_list_cache_on_startup = True
+        self._prewarm_list_methods_limit = 12
         self._tmdb_api = TmdbApi()
         self._media_chain = MediaChain()
         self._tmdb_detail_cache: Dict[Tuple[str, int], Optional[dict]] = {}
@@ -154,6 +174,10 @@ class MultiRatingsRecommend(_PluginBase):
         self._douban_web_quota_lock = Lock()
         self._douban_web_quota_date: str = ""
         self._douban_web_quota_count: int = 0
+        self._list_cache_lock = Lock()
+        self._list_result_cache: Dict[str, Dict[str, Any]] = {}
+        self._list_prewarm_thread: Optional[Thread] = None
+        self._list_prewarm_running = False
         self._imdb_blocked_until: float = 0
         self._imdb_block_reason: str = ""
         self._imdb_dataset_status: str = "未启用"
@@ -183,6 +207,11 @@ class MultiRatingsRecommend(_PluginBase):
             "omdb_api_key": "",
             "max_items": 30,
             "list_enrich_timeout": 6,
+            "item_enrich_timeout": 8,
+            "enable_list_result_cache": True,
+            "list_cache_ttl_seconds": 900,
+            "prewarm_list_cache_on_startup": True,
+            "prewarm_list_methods_limit": 12,
         }
 
     def init_plugin(self, config: dict = None):
@@ -216,6 +245,20 @@ class MultiRatingsRecommend(_PluginBase):
             self._list_enrich_timeout = max(1.0, min(float(conf.get("list_enrich_timeout") or 6), 20.0))
         except (TypeError, ValueError):
             self._list_enrich_timeout = 6.0
+        try:
+            self._item_enrich_timeout = max(1.0, min(float(conf.get("item_enrich_timeout") or 8), 30.0))
+        except (TypeError, ValueError):
+            self._item_enrich_timeout = 8.0
+        self._enable_list_result_cache = bool(conf.get("enable_list_result_cache", True))
+        try:
+            self._list_cache_ttl_seconds = max(60, min(int(conf.get("list_cache_ttl_seconds") or 900), 24 * 3600))
+        except (TypeError, ValueError):
+            self._list_cache_ttl_seconds = 900
+        self._prewarm_list_cache_on_startup = bool(conf.get("prewarm_list_cache_on_startup", True))
+        try:
+            self._prewarm_list_methods_limit = max(1, min(int(conf.get("prewarm_list_methods_limit") or 12), len(self._PREWARM_LIST_METHODS)))
+        except (TypeError, ValueError):
+            self._prewarm_list_methods_limit = 12
         self._reset_runtime_cache()
         self._load_douban_block_state()
         self._load_douban_rating_store()
@@ -224,6 +267,7 @@ class MultiRatingsRecommend(_PluginBase):
         self._refresh_imdb_dataset_status()
         self._schedule_imdb_dataset_index_build()
         self._trigger_recommend_cache_clear()
+        self._schedule_list_cache_prewarm()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -439,6 +483,62 @@ class MultiRatingsRecommend(_PluginBase):
                 },
             },
             {
+                "component": "VTextField",
+                "props": {
+                    "model": "item_enrich_timeout",
+                    "label": "详情补分超时秒数",
+                    "type": "number",
+                    "min": 1,
+                    "max": 30,
+                    "class": "mb-2",
+                    "disabled": "{{ !enable }}",
+                    "hint": "超时自动降级为原始详情，避免详情页空白",
+                    "persistent-hint": True,
+                },
+            },
+            {
+                "component": "VSwitch",
+                "props": {
+                    "model": "enable_list_result_cache",
+                    "label": "启用推荐分类服务端缓存",
+                    "class": "mb-2",
+                    "disabled": "{{ !enable }}",
+                },
+            },
+            {
+                "component": "VTextField",
+                "props": {
+                    "model": "list_cache_ttl_seconds",
+                    "label": "推荐分类缓存 TTL 秒数",
+                    "type": "number",
+                    "min": 60,
+                    "max": 86400,
+                    "class": "mb-2",
+                    "disabled": "{{ !enable || !enable_list_result_cache }}",
+                },
+            },
+            {
+                "component": "VSwitch",
+                "props": {
+                    "model": "prewarm_list_cache_on_startup",
+                    "label": "启动时预热推荐分类缓存",
+                    "class": "mb-2",
+                    "disabled": "{{ !enable || !enable_list_result_cache }}",
+                },
+            },
+            {
+                "component": "VTextField",
+                "props": {
+                    "model": "prewarm_list_methods_limit",
+                    "label": "启动预热分类数量",
+                    "type": "number",
+                    "min": 1,
+                    "max": len(self._PREWARM_LIST_METHODS),
+                    "class": "mb-2",
+                    "disabled": "{{ !enable || !enable_list_result_cache || !prewarm_list_cache_on_startup }}",
+                },
+            },
+            {
                 "component": "VSwitch",
                 "props": {
                     "model": "enable_diagnostics",
@@ -466,8 +566,14 @@ class MultiRatingsRecommend(_PluginBase):
                     f"IMDb 来源：{self._imdb_source}；"
                     f"最大补分条数：{self._max_items}；"
                     f"单条超时：{self._list_enrich_timeout:.1f}s；"
+                    f"详情超时：{self._item_enrich_timeout:.1f}s；"
                     f"列表并发：{self._LIST_ENRICH_CONCURRENCY}；"
                     f"主评分策略：TMDB / 豆瓣 取低分，缺失时回退 IMDb"
+                    + (
+                        f"；分类缓存：{len(self._list_result_cache)} 条，TTL {self._list_cache_ttl_seconds}s"
+                        if self._enable_list_result_cache
+                        else "；分类缓存：关闭"
+                    )
                     + (f"；豆瓣状态：{self._douban_block_reason}" if self._douban_blocked_until > time.time() else "")
                     + (
                         "；豆瓣网页兜底：关闭"
@@ -523,6 +629,9 @@ class MultiRatingsRecommend(_PluginBase):
         self._douban_next_request_at = 0
         self._douban_web_quota_date = ""
         self._douban_web_quota_count = 0
+        self._clear_list_result_cache()
+        self._list_prewarm_running = False
+        self._list_prewarm_thread = None
         self._imdb_blocked_until = 0
         self._imdb_block_reason = ""
         self._imdb_dataset_meta = {}
@@ -555,13 +664,140 @@ class MultiRatingsRecommend(_PluginBase):
             return await self._handle_async_media_list(method, *args, **kwargs)
         return handler
 
+    @staticmethod
+    def _normalize_cache_scalar(value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, MediaType):
+            return value.value
+        if isinstance(value, (list, tuple)):
+            return tuple(MultiRatingsRecommend._normalize_cache_scalar(item) for item in value)
+        if isinstance(value, dict):
+            return {
+                str(key): MultiRatingsRecommend._normalize_cache_scalar(item)
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            }
+        return str(value)
+
+    def _build_list_cache_key(self, method: str, args: Sequence[Any], kwargs: Dict[str, Any]) -> str:
+        normalized_kwargs = dict(kwargs or {})
+        if "page" not in normalized_kwargs:
+            normalized_kwargs["page"] = 1
+        payload = {
+            "method": method,
+            "args": [self._normalize_cache_scalar(item) for item in (args or [])],
+            "kwargs": {
+                str(key): self._normalize_cache_scalar(value)
+                for key, value in sorted(normalized_kwargs.items(), key=lambda pair: str(pair[0]))
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def _serialize_media_items(items: Sequence[MediaInfo]) -> List[dict]:
+        result: List[dict] = []
+        for media in items or []:
+            if isinstance(media, MediaInfo):
+                result.append(media.to_dict())
+        return result
+
+    @staticmethod
+    def _deserialize_media_items(payload: Sequence[dict]) -> Tuple[MediaInfo, ...]:
+        items: List[MediaInfo] = []
+        for data in payload or []:
+            if not isinstance(data, dict):
+                continue
+            media = MediaInfo()
+            media.from_dict(data)
+            items.append(media)
+        return tuple(items)
+
+    def _clear_list_result_cache(self):
+        with self._list_cache_lock:
+            self._list_result_cache.clear()
+
+    def _get_list_result_cache(self, cache_key: str) -> Optional[Tuple[MediaInfo, ...]]:
+        if not self._enable_list_result_cache:
+            return None
+        now = time.time()
+        with self._list_cache_lock:
+            entry = self._list_result_cache.get(cache_key)
+            if not entry:
+                return None
+            ts = float(entry.get("ts") or 0)
+            if now - ts > self._list_cache_ttl_seconds:
+                self._list_result_cache.pop(cache_key, None)
+                return None
+            payload = entry.get("items") or []
+        return self._deserialize_media_items(payload)
+
+    def _set_list_result_cache(self, cache_key: str, items: Sequence[MediaInfo]):
+        if not self._enable_list_result_cache:
+            return
+        payload = self._serialize_media_items(items)
+        with self._list_cache_lock:
+            self._list_result_cache[cache_key] = {
+                "ts": time.time(),
+                "items": payload,
+            }
+            if len(self._list_result_cache) > self._LIST_RESULT_CACHE_MAX_ENTRIES:
+                oldest = min(self._list_result_cache.items(), key=lambda item: float(item[1].get("ts") or 0))[0]
+                self._list_result_cache.pop(oldest, None)
+
+    def _schedule_list_cache_prewarm(self):
+        if not self._enabled or not self._enable_list_result_cache or not self._prewarm_list_cache_on_startup:
+            return
+        if self._list_prewarm_thread and self._list_prewarm_thread.is_alive():
+            return
+        self._list_prewarm_running = True
+        thread = Thread(
+            target=self._run_list_cache_prewarm,
+            daemon=True,
+            name="mp-list-cache-prewarm",
+        )
+        self._list_prewarm_thread = thread
+        thread.start()
+
+    def _run_list_cache_prewarm(self):
+        try:
+            asyncio.run(self._prewarm_list_cache())
+        except Exception as err:
+            logger.warn(f"推荐分类缓存预热失败：{err}")
+        finally:
+            self._list_prewarm_running = False
+
+    async def _prewarm_list_cache(self):
+        selected_methods = self._PREWARM_LIST_METHODS[: self._prewarm_list_methods_limit]
+        for method in selected_methods:
+            try:
+                medias = await self._async_call_system_method_excluding_self(method)
+                result = await self._build_result(medias)
+                cache_key = self._build_list_cache_key(method, (), {})
+                self._set_list_result_cache(cache_key, result)
+            except Exception as err:
+                logger.warn(f"预热分类 {method} 失败：{err}")
+
     def _handle_sync_media_item(self, method: str, *args, **kwargs):
         media = self._call_system_method(method, *args, **kwargs)
         if self._is_missing_media(media):
             media = self._run_async(self._fallback_media_item(media, **kwargs))
         if self._is_missing_media(media):
             return media
-        return self._run_async(self._enrich_media(self._clone_media(media), enrich_context="item"))
+        original = self._clone_media(media)
+        try:
+            return self._run_async(
+                asyncio.wait_for(
+                    self._enrich_media(self._clone_media(media), enrich_context="item"),
+                    timeout=self._item_enrich_timeout,
+                )
+            )
+        except asyncio.TimeoutError:
+            logger.warn(f"详情补分超时，降级原始详情：{original.title or original.tmdb_id or method}")
+        except Exception as err:
+            logger.warn(f"详情补分失败，降级原始详情：{original.title or original.tmdb_id or method} - {err}")
+        original.overview = self._strip_rating_overview(original.overview)
+        original.tagline = ""
+        return original
 
     async def _handle_async_media_item(self, method: str, *args, **kwargs):
         media = await self._async_call_system_method(method, *args, **kwargs)
@@ -569,15 +805,39 @@ class MultiRatingsRecommend(_PluginBase):
             media = await self._fallback_media_item(media, **kwargs)
         if self._is_missing_media(media):
             return media
-        return await self._enrich_media(self._clone_media(media), enrich_context="item")
+        original = self._clone_media(media)
+        try:
+            return await asyncio.wait_for(
+                self._enrich_media(self._clone_media(media), enrich_context="item"),
+                timeout=self._item_enrich_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warn(f"详情补分超时，降级原始详情：{original.title or original.tmdb_id or method}")
+        except Exception as err:
+            logger.warn(f"详情补分失败，降级原始详情：{original.title or original.tmdb_id or method} - {err}")
+        original.overview = self._strip_rating_overview(original.overview)
+        original.tagline = ""
+        return original
 
     def _handle_sync_media_list(self, method: str, *args, **kwargs):
+        cache_key = self._build_list_cache_key(method, args, kwargs)
+        cached_result = self._get_list_result_cache(cache_key)
+        if cached_result is not None:
+            return cached_result
         medias = self._call_system_method(method, *args, **kwargs)
-        return self._run_async(self._build_result(medias))
+        result = self._run_async(self._build_result(medias))
+        self._set_list_result_cache(cache_key, result)
+        return result
 
     async def _handle_async_media_list(self, method: str, *args, **kwargs):
+        cache_key = self._build_list_cache_key(method, args, kwargs)
+        cached_result = self._get_list_result_cache(cache_key)
+        if cached_result is not None:
+            return cached_result
         medias = await self._async_call_system_method(method, *args, **kwargs)
-        return await self._build_result(medias)
+        result = await self._build_result(medias)
+        self._set_list_result_cache(cache_key, result)
+        return result
 
     def _call_system_method(self, method: str, *args, **kwargs):
         result = None
@@ -1759,6 +2019,10 @@ class MultiRatingsRecommend(_PluginBase):
             "douban_web_daily_limit": self._douban_web_daily_limit,
             "douban_web_quota_date": self._douban_web_quota_date,
             "douban_web_quota_used": self._douban_web_quota_count,
+            "list_cache_enabled": self._enable_list_result_cache,
+            "list_cache_entries": len(self._list_result_cache),
+            "list_cache_ttl_seconds": self._list_cache_ttl_seconds,
+            "list_cache_prewarm_running": self._list_prewarm_running,
             "dataset_path": self._imdb_ratings_path,
             "dataset_status": self._imdb_dataset_status,
             "dataset_building": self._imdb_dataset_building,
@@ -2082,6 +2346,7 @@ class MultiRatingsRecommend(_PluginBase):
         return result[0] if result else None
 
     def _trigger_recommend_cache_clear(self):
+        self._clear_list_result_cache()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:

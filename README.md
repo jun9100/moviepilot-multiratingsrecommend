@@ -33,7 +33,7 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 2. 安装插件 `MultiRatingsRecommend`。
 3. 在插件配置页启用插件，并按需填写 `OMDb API Key` 或 IMDb 官方数据集路径。
 
-> 当前文档对应版本：`v0.6.15`
+> 当前文档对应版本：`v0.6.16`
 >
 > 评分链路排障文档：`docs/RATING_LOGIC_MAP.md`
 

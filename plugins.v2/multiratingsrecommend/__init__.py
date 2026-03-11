@@ -26,7 +26,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / TMDB 的低分，缺失时依次回退 IMDb、Bangumi。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.15"
+    plugin_version = "0.6.16"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -97,6 +97,8 @@ class MultiRatingsRecommend(_PluginBase):
         "Bangumi": 3,
     }
     _LIST_ENRICH_CONCURRENCY = 6
+    _DOUBAN_ENRICH_TIMEOUT_ITEM = 4.0
+    _DOUBAN_ENRICH_TIMEOUT_LIST = 2.5
     _OMDB_BLOCK_STATE_KEY = "omdb_block_state"
     _DOUBAN_BLOCK_STATE_KEY = "douban_block_state"
     _DOUBAN_RATING_STORE_KEY = "douban_rating_store"
@@ -982,7 +984,19 @@ class MultiRatingsRecommend(_PluginBase):
 
         douban_info = None
         if self._enable_douban:
-            douban_info = await self._resolve_douban_info(media, enrich_context=enrich_context)
+            douban_timeout = (
+                self._DOUBAN_ENRICH_TIMEOUT_ITEM
+                if str(enrich_context or "").strip().lower() == "item"
+                else self._DOUBAN_ENRICH_TIMEOUT_LIST
+            )
+            try:
+                douban_info = await asyncio.wait_for(
+                    self._resolve_douban_info(media, enrich_context=enrich_context),
+                    timeout=douban_timeout,
+                )
+            except asyncio.TimeoutError:
+                diagnostic_notes.append(f"豆瓣：解析超时（>{douban_timeout:.1f}s），跳过")
+                douban_info = None
             if douban_info:
                 douban_id = douban_info.get("id")
                 if douban_id:

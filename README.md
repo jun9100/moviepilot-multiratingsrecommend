@@ -36,6 +36,35 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 > 当前文档对应版本：`v0.6.21`
 >
 > 评分链路排障文档：`docs/RATING_LOGIC_MAP.md`
+>
+> 工作流模组快速配置：`docs/WORKFLOW_MODULE_QUICKSTART.md`
+
+## 工作流模组快速配置（给其他用户）
+
+推荐链路：
+
+```text
+获取媒体 -> 过滤媒体 -> 调用插件(过滤媒体关键词) -> 添加订阅
+```
+
+1. 在插件页先配置默认值（供工作流节点留空时自动使用）：
+   - `workflow_auto_exclude`
+   - `workflow_auto_min_vote_count`
+   - `workflow_auto_min_days_since_release`
+2. 在工作流画布添加 `调用插件` 节点，选择：
+   - 插件：`全平台低分保护`
+   - 动作：`过滤媒体关键词`
+3. `action_params` 可以留空 `{}`，插件会自动回落到上面的默认值。
+
+如果需要按某条工作流单独覆盖参数，可在 `action_params` 填：
+
+```json
+{
+  "exclude": "同性|男同|女同|女童|LGBT|LGBTQ|Gay|Lesbian|BL|GL|Queer|耽美|百合|杜比|Dolby|Dolby\\s*Vision|DOVI|DoVi|\\bDV\\b|HDR10\\+",
+  "min_vote_count": 100,
+  "min_days_since_release": 14
+}
+```
 
 ## 配置项
 

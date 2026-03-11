@@ -33,7 +33,7 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 2. 安装插件 `MultiRatingsRecommend`。
 3. 在插件配置页启用插件，并按需填写 `OMDb API Key` 或 IMDb 官方数据集路径。
 
-> 当前文档对应版本：`v0.6.4`
+> 当前文档对应版本：`v0.6.5`
 
 ## 配置项
 
@@ -43,6 +43,9 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 - `enable_external_douban`: 是否启用外部豆瓣详情 API 兜底
 - `external_douban_url_template`: 外部豆瓣详情 URL 模板，支持 `{douban_id} {media_type} {title} {year}`
 - `douban_web_cookie`: 豆瓣网页 Cookie（可选），用于网页评分兜底在需要登录态时继续抓取评分
+- `enable_douban_web_fallback`: 是否启用豆瓣网页评分兜底
+- `douban_web_fallback_detail_only`: 是否仅在详情页触发豆瓣网页兜底（推荐开启）
+- `douban_web_daily_limit`: 豆瓣网页兜底每日请求上限（`0` 表示不限）
 - `enable_diagnostics`: 是否在插件页显示最近补分诊断记录
 - `imdb_source`: IMDb 数据来源，可选 `auto / dataset / omdb`
 - `imdb_ratings_path`: IMDb 官方 `title.ratings.tsv` 或 `title.ratings.tsv.gz` 的本地路径
@@ -57,6 +60,7 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 - 当豆瓣 `douban_id` 已知但内置详情仍无评分时，插件会尝试从豆瓣网页提取评分作为最后兜底。
 - 豆瓣请求新增风控保护：自动限速；命中 `error code:004`/`sec.douban.com` 后自动熔断 6 小时，避免继续触发风控。
 - 已命中的豆瓣评分会持久化到插件本地缓存；风控期间会优先回读本地缓存，并继续尝试外部豆瓣 API（如果已配置）。
+- 新增网页兜底精细控制：可整体验证关闭、可限制仅详情页触发、可限制每日网页请求上限。
 - 插件页支持补分诊断模式，可直接查看最近的评分命中来源和失败原因。
 - 新增插件 API：
   - `GET /api/v1/plugin/MultiRatingsRecommend/imdb/status`
@@ -130,6 +134,16 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 - 若你配置了外部豆瓣详情 API，仍会继续尝试外部 API 兜底
 
 说明：熔断不是永久禁用，默认 6 小时后自动恢复尝试。
+
+## 豆瓣网页兜底控制（v0.6.5）
+
+推荐默认策略（兼顾稳定和覆盖率）：
+
+- 启用豆瓣网页评分兜底 = 开
+- 仅详情页触发豆瓣网页兜底 = 开
+- 豆瓣网页兜底每日请求上限 = 100（可按需调整）
+
+这样列表页会优先使用内置豆瓣数据和本地缓存，不会大规模打豆瓣网页；只有用户真正点进详情页时才做最后兜底，显著降低“分类空白/超时”概率。
 
 ## IMDb 官方数据集模式
 

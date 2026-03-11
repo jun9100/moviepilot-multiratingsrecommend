@@ -26,7 +26,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.4"
+    plugin_version = "0.6.5"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -100,6 +100,7 @@ class MultiRatingsRecommend(_PluginBase):
     _OMDB_BLOCK_STATE_KEY = "omdb_block_state"
     _DOUBAN_BLOCK_STATE_KEY = "douban_block_state"
     _DOUBAN_RATING_STORE_KEY = "douban_rating_store"
+    _DOUBAN_WEB_QUOTA_KEY = "douban_web_quota"
     _DOUBAN_BLOCK_HOURS = 6
     _DOUBAN_MIN_INTERVAL_SECONDS = 1.2
     _DOUBAN_RATING_STORE_LIMIT = 5000
@@ -129,6 +130,9 @@ class MultiRatingsRecommend(_PluginBase):
         self._enable_external_douban = False
         self._external_douban_url_template = ""
         self._douban_web_cookie = ""
+        self._enable_douban_web_fallback = True
+        self._douban_web_fallback_detail_only = True
+        self._douban_web_daily_limit = 100
         self._enable_diagnostics = False
         self._imdb_source = "auto"
         self._imdb_ratings_path = ""
@@ -146,6 +150,9 @@ class MultiRatingsRecommend(_PluginBase):
         self._douban_rating_store: Dict[str, Dict[str, Any]] = {}
         self._douban_rate_lock = Lock()
         self._douban_next_request_at: float = 0
+        self._douban_web_quota_lock = Lock()
+        self._douban_web_quota_date: str = ""
+        self._douban_web_quota_count: int = 0
         self._imdb_blocked_until: float = 0
         self._imdb_block_reason: str = ""
         self._imdb_dataset_status: str = "未启用"
@@ -166,6 +173,9 @@ class MultiRatingsRecommend(_PluginBase):
             "enable_external_douban": False,
             "external_douban_url_template": "",
             "douban_web_cookie": "",
+            "enable_douban_web_fallback": True,
+            "douban_web_fallback_detail_only": True,
+            "douban_web_daily_limit": 100,
             "enable_diagnostics": False,
             "imdb_source": "auto",
             "imdb_ratings_path": "",
@@ -186,6 +196,12 @@ class MultiRatingsRecommend(_PluginBase):
         self._enable_external_douban = bool(conf.get("enable_external_douban"))
         self._external_douban_url_template = str(conf.get("external_douban_url_template") or "").strip()
         self._douban_web_cookie = str(conf.get("douban_web_cookie") or "").strip()
+        self._enable_douban_web_fallback = bool(conf.get("enable_douban_web_fallback", True))
+        self._douban_web_fallback_detail_only = bool(conf.get("douban_web_fallback_detail_only", True))
+        try:
+            self._douban_web_daily_limit = max(0, int(conf.get("douban_web_daily_limit", 100) or 0))
+        except (TypeError, ValueError):
+            self._douban_web_daily_limit = 100
         self._enable_diagnostics = bool(conf.get("enable_diagnostics"))
         self._imdb_source = str(conf.get("imdb_source") or "auto").strip().lower()
         self._imdb_ratings_path = str(conf.get("imdb_ratings_path") or "").strip()
@@ -197,6 +213,7 @@ class MultiRatingsRecommend(_PluginBase):
         self._reset_runtime_cache()
         self._load_douban_block_state()
         self._load_douban_rating_store()
+        self._load_douban_web_quota_state()
         self._load_omdb_block_state()
         self._refresh_imdb_dataset_status()
         self._schedule_imdb_dataset_index_build()
@@ -321,6 +338,37 @@ class MultiRatingsRecommend(_PluginBase):
                 },
             },
             {
+                "component": "VSwitch",
+                "props": {
+                    "model": "enable_douban_web_fallback",
+                    "label": "启用豆瓣网页评分兜底",
+                    "class": "mb-2",
+                    "disabled": "{{ !enable || !enable_douban }}",
+                },
+            },
+            {
+                "component": "VSwitch",
+                "props": {
+                    "model": "douban_web_fallback_detail_only",
+                    "label": "仅详情页触发豆瓣网页兜底",
+                    "class": "mb-2",
+                    "disabled": "{{ !enable || !enable_douban || !enable_douban_web_fallback }}",
+                },
+            },
+            {
+                "component": "VTextField",
+                "props": {
+                    "model": "douban_web_daily_limit",
+                    "label": "豆瓣网页兜底每日请求上限（0=不限）",
+                    "type": "number",
+                    "min": 0,
+                    "class": "mb-2",
+                    "disabled": "{{ !enable || !enable_douban || !enable_douban_web_fallback }}",
+                    "hint": "建议 50~200，降低风控风险",
+                    "persistent-hint": True,
+                },
+            },
+            {
                 "component": "VSelect",
                 "props": {
                     "model": "imdb_source",
@@ -382,6 +430,7 @@ class MultiRatingsRecommend(_PluginBase):
         ], self._default_config()
 
     def get_page(self) -> Optional[List[dict]]:
+        self._sync_douban_web_quota_date()
         page = [
             {
                 "component": "VAlert",
@@ -399,6 +448,14 @@ class MultiRatingsRecommend(_PluginBase):
                     f"列表并发：{self._LIST_ENRICH_CONCURRENCY}；"
                     f"主评分策略：TMDB / 豆瓣 取低分，缺失时回退 IMDb"
                     + (f"；豆瓣状态：{self._douban_block_reason}" if self._douban_blocked_until > time.time() else "")
+                    + (
+                        "；豆瓣网页兜底：关闭"
+                        if not self._enable_douban_web_fallback
+                        else (
+                            f"；豆瓣网页兜底：{'仅详情页' if self._douban_web_fallback_detail_only else '详情+列表'}，"
+                            f"今日 {self._douban_web_quota_count}/{self._douban_web_daily_limit if self._douban_web_daily_limit else '∞'}"
+                        )
+                    )
                     + (f"；IMDb 数据集：{self._imdb_dataset_status}" if self._enable_imdb else "")
                     + (f"；OMDb 状态：{self._imdb_block_reason}" if self._imdb_blocked_until > time.time() else "")
                 ),
@@ -443,6 +500,8 @@ class MultiRatingsRecommend(_PluginBase):
         self._douban_blocked_until = 0
         self._douban_block_reason = ""
         self._douban_next_request_at = 0
+        self._douban_web_quota_date = ""
+        self._douban_web_quota_count = 0
         self._imdb_blocked_until = 0
         self._imdb_block_reason = ""
         self._imdb_dataset_meta = {}
@@ -481,7 +540,7 @@ class MultiRatingsRecommend(_PluginBase):
             media = self._run_async(self._fallback_media_item(media, **kwargs))
         if self._is_missing_media(media):
             return media
-        return self._run_async(self._enrich_media(self._clone_media(media)))
+        return self._run_async(self._enrich_media(self._clone_media(media), enrich_context="item"))
 
     async def _handle_async_media_item(self, method: str, *args, **kwargs):
         media = await self._async_call_system_method(method, *args, **kwargs)
@@ -489,7 +548,7 @@ class MultiRatingsRecommend(_PluginBase):
             media = await self._fallback_media_item(media, **kwargs)
         if self._is_missing_media(media):
             return media
-        return await self._enrich_media(self._clone_media(media))
+        return await self._enrich_media(self._clone_media(media), enrich_context="item")
 
     def _handle_sync_media_list(self, method: str, *args, **kwargs):
         medias = self._call_system_method(method, *args, **kwargs)
@@ -574,7 +633,7 @@ class MultiRatingsRecommend(_PluginBase):
 
             async def _enrich_with_limit(index: int) -> MediaInfo:
                 async with semaphore:
-                    return await self._enrich_media(items[index])
+                    return await self._enrich_media(items[index], enrich_context="list")
 
             enriched_items = await asyncio.gather(*(_enrich_with_limit(index) for index in range(target_count)))
             items[:target_count] = enriched_items
@@ -582,7 +641,7 @@ class MultiRatingsRecommend(_PluginBase):
             items[index].overview = self._strip_rating_overview(items[index].overview)
         return tuple(items)
 
-    async def _enrich_media(self, media: MediaInfo) -> MediaInfo:
+    async def _enrich_media(self, media: MediaInfo, enrich_context: str = "item") -> MediaInfo:
         media.overview = self._strip_rating_overview(media.overview)
         media.tagline = ""
 
@@ -610,7 +669,7 @@ class MultiRatingsRecommend(_PluginBase):
 
         douban_info = None
         if self._enable_douban:
-            douban_info = await self._resolve_douban_info(media)
+            douban_info = await self._resolve_douban_info(media, enrich_context=enrich_context)
             if douban_info:
                 douban_id = douban_info.get("id")
                 if douban_id:
@@ -709,11 +768,18 @@ class MultiRatingsRecommend(_PluginBase):
 
         return media
 
-    async def _resolve_douban_info(self, media: MediaInfo) -> Optional[dict]:
+    async def _resolve_douban_info(self, media: MediaInfo, enrich_context: str = "item") -> Optional[dict]:
         media_type = self._get_media_type(media.type)
+        allow_web_fallback = self._should_use_douban_web_fallback(enrich_context=enrich_context)
         douban_info = None
         if media.douban_id:
-            douban_info = await self._get_douban_info_by_id(media.douban_id, media_type, media)
+            douban_info = await self._get_douban_info_by_id(
+                media.douban_id,
+                media_type,
+                media,
+                allow_web_fallback=allow_web_fallback,
+                enrich_context=enrich_context,
+            )
             if douban_info and self._extract_douban_rating(douban_info) is not None:
                 return douban_info
 
@@ -732,11 +798,22 @@ class MultiRatingsRecommend(_PluginBase):
         ):
             douban_info = self._prefer_douban_info(
                 douban_info,
-                await self._match_douban_info(media, media.imdb_id),
+                await self._match_douban_info(
+                    media,
+                    media.imdb_id,
+                    allow_web_fallback=allow_web_fallback,
+                    enrich_context=enrich_context,
+                ),
             )
         douban_id = douban_info.get("id") if douban_info else None
         if douban_id and self._extract_douban_rating(douban_info) is None:
-            detail = await self._get_douban_info_by_id(str(douban_id), media_type, media)
+            detail = await self._get_douban_info_by_id(
+                str(douban_id),
+                media_type,
+                media,
+                allow_web_fallback=allow_web_fallback,
+                enrich_context=enrich_context,
+            )
             if detail:
                 douban_info = detail
 
@@ -805,6 +882,7 @@ class MultiRatingsRecommend(_PluginBase):
             ),
             "TMDB映射",
         )
+        info = self._enrich_with_cached_douban_rating(info)
         self._remember_douban_rating_from_info(info)
         self._douban_info_cache[cache_key] = info
         return info
@@ -823,6 +901,7 @@ class MultiRatingsRecommend(_PluginBase):
             ),
             "Bangumi映射",
         )
+        info = self._enrich_with_cached_douban_rating(info)
         self._remember_douban_rating_from_info(info)
         self._douban_info_cache[cache_key] = info
         return info
@@ -832,6 +911,8 @@ class MultiRatingsRecommend(_PluginBase):
         douban_id: str,
         media_type: Optional[MediaType],
         media: Optional[MediaInfo] = None,
+        allow_web_fallback: bool = True,
+        enrich_context: str = "item",
     ) -> Optional[dict]:
         cache_key = ("id", str(douban_id), media_type.value if media_type else "")
         if cache_key in self._douban_info_cache:
@@ -876,8 +957,11 @@ class MultiRatingsRecommend(_PluginBase):
                 )
                 info = self._prefer_douban_info(info, recognized_info)
 
-            if not info or self._extract_douban_rating(info) is None:
-                web_rating = await self._get_douban_web_rating_by_id(str(douban_id))
+            if (not info or self._extract_douban_rating(info) is None) and allow_web_fallback:
+                web_rating = await self._get_douban_web_rating_by_id(
+                    str(douban_id),
+                    enrich_context=enrich_context,
+                )
                 if web_rating is not None:
                     base = dict(info or {})
                     base["id"] = str(base.get("id") or douban_id)
@@ -896,7 +980,7 @@ class MultiRatingsRecommend(_PluginBase):
         self._douban_info_cache[cache_key] = info
         return info
 
-    async def _get_douban_web_rating_by_id(self, douban_id: str) -> Optional[float]:
+    async def _get_douban_web_rating_by_id(self, douban_id: str, enrich_context: str = "item") -> Optional[float]:
         douban_id = str(douban_id or "").strip()
         if not douban_id:
             return None
@@ -904,7 +988,13 @@ class MultiRatingsRecommend(_PluginBase):
             return self._douban_web_rating_cache[douban_id]
         cached_info = self._build_cached_douban_info(douban_id)
         cached_rating = self._extract_douban_rating(cached_info)
+        if not self._should_use_douban_web_fallback(enrich_context=enrich_context):
+            self._douban_web_rating_cache[douban_id] = cached_rating
+            return cached_rating
         if self._is_douban_blocked():
+            self._douban_web_rating_cache[douban_id] = cached_rating
+            return cached_rating
+        if not self._try_consume_douban_web_quota():
             self._douban_web_rating_cache[douban_id] = cached_rating
             return cached_rating
         await self._wait_douban_slot()
@@ -960,7 +1050,13 @@ class MultiRatingsRecommend(_PluginBase):
                 return cls._normalize_rating(matched.group(1))
         return None
 
-    async def _match_douban_info(self, media: MediaInfo, imdb_id: Optional[str]) -> Optional[dict]:
+    async def _match_douban_info(
+        self,
+        media: MediaInfo,
+        imdb_id: Optional[str],
+        allow_web_fallback: bool = True,
+        enrich_context: str = "item",
+    ) -> Optional[dict]:
         titles = self._candidate_titles(media)
         cache_key = (
             "match",
@@ -998,9 +1094,16 @@ class MultiRatingsRecommend(_PluginBase):
                     ),
                 )
                 matched = self._annotate_douban_info(matched, attempt["source"])
+                matched = self._enrich_with_cached_douban_rating(matched)
                 douban_id = matched.get("id") if matched else None
                 if douban_id:
-                    detail = await self._get_douban_info_by_id(str(douban_id), media_type, media)
+                    detail = await self._get_douban_info_by_id(
+                        str(douban_id),
+                        media_type,
+                        media,
+                        allow_web_fallback=allow_web_fallback,
+                        enrich_context=enrich_context,
+                    )
                     if detail:
                         if not detail.get("id"):
                             detail["id"] = str(douban_id)
@@ -1086,6 +1189,7 @@ class MultiRatingsRecommend(_PluginBase):
         try:
             payload = await AsyncRequestUtils(timeout=8).get_json(url)
             info = self._normalize_external_douban_info(payload, douban_id)
+            info = self._enrich_with_cached_douban_rating(info)
             if info:
                 self._external_douban_status = "已配置且可用"
                 self._remember_douban_rating_from_info(info)
@@ -1453,6 +1557,48 @@ class MultiRatingsRecommend(_PluginBase):
         self._douban_rating_store = store
         self._trim_douban_rating_store()
 
+    def _load_douban_web_quota_state(self):
+        data = self.get_data(self._DOUBAN_WEB_QUOTA_KEY) or {}
+        if isinstance(data, dict):
+            self._douban_web_quota_date = str(data.get("date") or "")
+            try:
+                self._douban_web_quota_count = max(0, int(data.get("count") or 0))
+            except (TypeError, ValueError):
+                self._douban_web_quota_count = 0
+        else:
+            self._douban_web_quota_date = ""
+            self._douban_web_quota_count = 0
+        self._sync_douban_web_quota_date()
+
+    def _save_douban_web_quota_state(self):
+        self.save_data(
+            self._DOUBAN_WEB_QUOTA_KEY,
+            {
+                "date": self._douban_web_quota_date,
+                "count": self._douban_web_quota_count,
+            },
+        )
+
+    @staticmethod
+    def _today_str() -> str:
+        return time.strftime("%Y-%m-%d", time.localtime())
+
+    def _sync_douban_web_quota_date(self):
+        today = self._today_str()
+        if self._douban_web_quota_date != today:
+            self._douban_web_quota_date = today
+            self._douban_web_quota_count = 0
+            self._save_douban_web_quota_state()
+
+    def _try_consume_douban_web_quota(self) -> bool:
+        with self._douban_web_quota_lock:
+            self._sync_douban_web_quota_date()
+            if self._douban_web_daily_limit > 0 and self._douban_web_quota_count >= self._douban_web_daily_limit:
+                return False
+            self._douban_web_quota_count += 1
+            self._save_douban_web_quota_state()
+            return True
+
     def _trim_douban_rating_store(self):
         if len(self._douban_rating_store) <= self._DOUBAN_RATING_STORE_LIMIT:
             return
@@ -1493,6 +1639,31 @@ class MultiRatingsRecommend(_PluginBase):
         rating = self._extract_douban_rating(info)
         if douban_id and rating is not None:
             self._remember_douban_rating(douban_id, rating, str(info.get("__mr_source") or "未知来源"))
+
+    def _enrich_with_cached_douban_rating(self, info: Optional[dict]) -> Optional[dict]:
+        if not info:
+            return info
+        if self._extract_douban_rating(info) is not None:
+            return info
+        douban_id = str(info.get("id") or "").strip()
+        if not douban_id:
+            return info
+        cached_info = self._build_cached_douban_info(douban_id)
+        cached_rating = self._extract_douban_rating(cached_info)
+        if cached_rating is None:
+            return info
+        merged = dict(info)
+        merged["id"] = douban_id
+        merged["rating"] = {"value": cached_rating}
+        source = str(info.get("__mr_source") or "未知来源")
+        return self._annotate_douban_info(merged, f"{source}+缓存")
+
+    def _should_use_douban_web_fallback(self, enrich_context: str = "item") -> bool:
+        if not self._enable_douban or not self._enable_douban_web_fallback:
+            return False
+        if self._douban_web_fallback_detail_only and str(enrich_context or "").strip().lower() != "item":
+            return False
+        return True
 
     def _build_cached_douban_info(self, douban_id: str) -> Optional[dict]:
         douban_id = str(douban_id or "").strip()
@@ -1538,6 +1709,7 @@ class MultiRatingsRecommend(_PluginBase):
         self.del_data(self._OMDB_BLOCK_STATE_KEY)
 
     def _get_imdb_status_payload(self) -> Dict[str, Any]:
+        self._sync_douban_web_quota_date()
         built_at = self._imdb_dataset_meta.get("built_at")
         return {
             "enabled": self._enabled,
@@ -1549,6 +1721,11 @@ class MultiRatingsRecommend(_PluginBase):
             "douban_blocked_until": int(self._douban_blocked_until) if self._douban_blocked_until else 0,
             "douban_block_reason": self._douban_block_reason,
             "douban_rating_store_size": len(self._douban_rating_store),
+            "douban_web_fallback_enabled": self._enable_douban_web_fallback,
+            "douban_web_fallback_detail_only": self._douban_web_fallback_detail_only,
+            "douban_web_daily_limit": self._douban_web_daily_limit,
+            "douban_web_quota_date": self._douban_web_quota_date,
+            "douban_web_quota_used": self._douban_web_quota_count,
             "dataset_path": self._imdb_ratings_path,
             "dataset_status": self._imdb_dataset_status,
             "dataset_building": self._imdb_dataset_building,

@@ -27,7 +27,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / TMDB 的低分，缺失时依次回退 IMDb、Bangumi。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.19"
+    plugin_version = "0.6.20"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -142,6 +142,10 @@ class MultiRatingsRecommend(_PluginBase):
         r"^(?:(?:TMDB|IMDb|豆瓣|Bangumi)\s\d+(?:\.\d)?(?:\s/\s(?:TMDB|IMDb|豆瓣|Bangumi)\s\d+(?:\.\d)?)*)"
         r"(?:\s·\s)?"
     )
+    _WORKFLOW_AUTO_EXCLUDE_DEFAULT = (
+        r"同性|男同|女同|女童|LGBT|LGBTQ|Gay|Lesbian|BL|GL|Queer|耽美|百合|"
+        r"杜比|Dolby|Dolby\s*Vision|DOVI|DoVi|\bDV\b|HDR10\+"
+    )
 
     def __init__(self):
         super().__init__()
@@ -165,6 +169,10 @@ class MultiRatingsRecommend(_PluginBase):
         self._list_cache_ttl_seconds = 900
         self._prewarm_list_cache_on_startup = True
         self._prewarm_list_methods_limit = 12
+        self._workflow_auto_filter_enable = True
+        self._workflow_auto_exclude = self._WORKFLOW_AUTO_EXCLUDE_DEFAULT
+        self._workflow_auto_min_vote_count = 100
+        self._workflow_auto_min_days_since_release = 14
         self._tmdb_api = TmdbApi()
         self._media_chain = MediaChain()
         self._tmdb_detail_cache: Dict[Tuple[str, int], Optional[dict]] = {}
@@ -219,6 +227,10 @@ class MultiRatingsRecommend(_PluginBase):
             "list_cache_ttl_seconds": 900,
             "prewarm_list_cache_on_startup": True,
             "prewarm_list_methods_limit": 12,
+            "workflow_auto_filter_enable": True,
+            "workflow_auto_exclude": MultiRatingsRecommend._WORKFLOW_AUTO_EXCLUDE_DEFAULT,
+            "workflow_auto_min_vote_count": 100,
+            "workflow_auto_min_days_since_release": 14,
         }
 
     def init_plugin(self, config: dict = None):
@@ -266,6 +278,18 @@ class MultiRatingsRecommend(_PluginBase):
             self._prewarm_list_methods_limit = max(1, min(int(conf.get("prewarm_list_methods_limit") or 12), len(self._PREWARM_LIST_METHODS)))
         except (TypeError, ValueError):
             self._prewarm_list_methods_limit = 12
+        self._workflow_auto_filter_enable = bool(conf.get("workflow_auto_filter_enable", True))
+        self._workflow_auto_exclude = str(
+            conf.get("workflow_auto_exclude") or self._WORKFLOW_AUTO_EXCLUDE_DEFAULT
+        ).strip()
+        self._workflow_auto_min_vote_count = max(
+            0,
+            self._parse_int(conf.get("workflow_auto_min_vote_count"), default=100),
+        )
+        self._workflow_auto_min_days_since_release = max(
+            0,
+            self._parse_int(conf.get("workflow_auto_min_days_since_release"), default=14),
+        )
         self._reset_runtime_cache()
         self._load_douban_block_state()
         self._load_douban_rating_store()
@@ -595,6 +619,48 @@ class MultiRatingsRecommend(_PluginBase):
                     "disabled": "{{ !enable }}",
                 },
             },
+            {
+                "component": "VSwitch",
+                "props": {
+                    "model": "workflow_auto_filter_enable",
+                    "label": "工作流自动过滤（无需调用插件节点）",
+                    "class": "mb-2",
+                    "disabled": "{{ !enable }}",
+                },
+            },
+            {
+                "component": "VTextField",
+                "props": {
+                    "model": "workflow_auto_exclude",
+                    "label": "工作流自动过滤排除关键词（正则）",
+                    "placeholder": "例如：同性|LGBT|杜比|Dolby\\s*Vision|HDR10\\+",
+                    "clearable": True,
+                    "class": "mb-2",
+                    "disabled": "{{ !enable || !workflow_auto_filter_enable }}",
+                },
+            },
+            {
+                "component": "VTextField",
+                "props": {
+                    "model": "workflow_auto_min_vote_count",
+                    "label": "工作流评分稳定闸门：最低投票人数",
+                    "type": "number",
+                    "min": 0,
+                    "class": "mb-2",
+                    "disabled": "{{ !enable || !workflow_auto_filter_enable }}",
+                },
+            },
+            {
+                "component": "VTextField",
+                "props": {
+                    "model": "workflow_auto_min_days_since_release",
+                    "label": "工作流评分稳定闸门：上映最短天数",
+                    "type": "number",
+                    "min": 0,
+                    "class": "mb-2",
+                    "disabled": "{{ !enable || !workflow_auto_filter_enable }}",
+                },
+            },
         ], self._default_config()
 
     def get_page(self) -> Optional[List[dict]]:
@@ -616,6 +682,13 @@ class MultiRatingsRecommend(_PluginBase):
                     f"单条超时：{self._list_enrich_timeout:.1f}s；"
                     f"详情超时：{self._item_enrich_timeout:.1f}s；"
                     f"列表并发：{self._LIST_ENRICH_CONCURRENCY}；"
+                    f"工作流自动过滤：{'开启' if self._workflow_auto_filter_enable else '关闭'}"
+                    + (
+                        f"（{self._workflow_auto_min_vote_count}票/{self._workflow_auto_min_days_since_release}天）"
+                        if self._workflow_auto_filter_enable
+                        else ""
+                    )
+                    + "；"
                     f"主评分策略：豆瓣 / TMDB 取低分，缺失时依次回退 IMDb、Bangumi"
                     + (
                         f"；分类缓存：{len(self._list_result_cache)} 条，TTL {self._list_cache_ttl_seconds}s"
@@ -949,21 +1022,21 @@ class MultiRatingsRecommend(_PluginBase):
         cache_key = self._build_list_cache_key(method, args, kwargs)
         cached_result = self._get_list_result_cache(cache_key)
         if cached_result is not None:
-            return cached_result
+            return self._apply_workflow_auto_filter(cached_result, method=method, from_cache=True)
         medias = self._call_system_method(method, *args, **kwargs)
         result = self._run_async(self._build_result(medias))
         self._set_list_result_cache(cache_key, result)
-        return result
+        return self._apply_workflow_auto_filter(result, method=method, from_cache=False)
 
     async def _handle_async_media_list(self, method: str, *args, **kwargs):
         cache_key = self._build_list_cache_key(method, args, kwargs)
         cached_result = self._get_list_result_cache(cache_key)
         if cached_result is not None:
-            return cached_result
+            return self._apply_workflow_auto_filter(cached_result, method=method, from_cache=True)
         medias = await self._async_call_system_method(method, *args, **kwargs)
         result = await self._build_result(medias)
         self._set_list_result_cache(cache_key, result)
-        return result
+        return self._apply_workflow_auto_filter(result, method=method, from_cache=False)
 
     def _call_system_method(self, method: str, *args, **kwargs):
         result = None
@@ -2477,6 +2550,82 @@ class MultiRatingsRecommend(_PluginBase):
             if value:
                 parts.append(str(value))
         return " ".join(parts)
+
+    @staticmethod
+    def _compile_regex_pattern(pattern: Optional[str], label: str) -> Optional[re.Pattern]:
+        raw = str(pattern or "").strip()
+        if not raw:
+            return None
+        try:
+            return re.compile(raw, re.I)
+        except re.error:
+            logger.warn(f"媒体关键词过滤 {label} 非法正则，已降级字面匹配：{raw}")
+            return re.compile(re.escape(raw), re.I)
+
+    @classmethod
+    def _filter_media_list(
+        cls,
+        medias: Sequence[Any],
+        include: Optional[str] = None,
+        exclude: Optional[str] = None,
+        min_vote_count: int = 0,
+        min_days_since_release: int = 0,
+    ) -> Tuple[List[Any], int, int]:
+        include_re = cls._compile_regex_pattern(include, "include")
+        exclude_re = cls._compile_regex_pattern(exclude, "exclude")
+        min_vote_threshold = cls._parse_int(min_vote_count, default=0)
+        min_days_threshold = cls._parse_int(min_days_since_release, default=0)
+        enable_stability_guard = min_vote_threshold > 0 and min_days_threshold > 0
+
+        kept: List[Any] = []
+        blocked_keyword = 0
+        blocked_unstable = 0
+        for media in list(medias or []):
+            searchable = cls._build_media_keyword_text(media)
+            if include_re and not include_re.search(searchable):
+                continue
+            if exclude_re and exclude_re.search(searchable):
+                blocked_keyword += 1
+                continue
+            if enable_stability_guard and cls._is_unstable_media_rating(
+                media,
+                min_vote_count=min_vote_threshold,
+                min_days_since_release=min_days_threshold,
+            ):
+                blocked_unstable += 1
+                continue
+            kept.append(media)
+        return kept, blocked_keyword, blocked_unstable
+
+    @staticmethod
+    def _is_workflow_fetch_call() -> bool:
+        try:
+            for frame in inspect.stack(context=0):
+                filename = (frame.filename or "").replace("\\", "/")
+                if filename.endswith("/app/workflow/actions/fetch_medias.py") and frame.function == "execute":
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _apply_workflow_auto_filter(self, medias: Any, method: str, from_cache: bool) -> Any:
+        if not self._workflow_auto_filter_enable or not self._is_workflow_fetch_call():
+            return medias
+        if not isinstance(medias, (list, tuple)):
+            return medias
+        kept, blocked_keyword, blocked_unstable = self._filter_media_list(
+            medias,
+            exclude=self._workflow_auto_exclude,
+            min_vote_count=self._workflow_auto_min_vote_count,
+            min_days_since_release=self._workflow_auto_min_days_since_release,
+        )
+        logger.info(
+            f"工作流自动过滤[{method}]{'(缓存)' if from_cache else '(实时)'}："
+            f"{len(medias)} 条 -> {len(kept)} 条（关键词 {blocked_keyword}，不稳定评分 {blocked_unstable}）"
+        )
+        if isinstance(medias, tuple):
+            return tuple(kept)
+        return kept
 
     @staticmethod
     def _parse_int(value: Any, default: int = 0) -> int:

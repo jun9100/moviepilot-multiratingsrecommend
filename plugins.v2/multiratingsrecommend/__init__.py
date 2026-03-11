@@ -26,7 +26,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / TMDB 的低分，缺失时依次回退 IMDb、Bangumi。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.14"
+    plugin_version = "0.6.15"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -296,6 +296,13 @@ class MultiRatingsRecommend(_PluginBase):
                 "methods": ["POST"],
                 "summary": "重建 IMDb 数据集索引",
                 "description": "后台重建 IMDb title.ratings 数据集索引",
+            },
+            {
+                "path": "/imdb/unblock",
+                "endpoint": self.api_imdb_unblock,
+                "methods": ["POST"],
+                "summary": "清除 IMDb 熔断状态",
+                "description": "手动清除 OMDb 限流熔断状态，并清空 IMDb 评分内存缓存",
             },
         ]
 
@@ -615,6 +622,14 @@ class MultiRatingsRecommend(_PluginBase):
         return {
             "success": started or self._imdb_dataset_building,
             "started": started,
+            "status": self._get_imdb_status_payload(),
+        }
+
+    def api_imdb_unblock(self) -> Dict[str, Any]:
+        self._clear_omdb_block_state()
+        self._imdb_rating_cache.clear()
+        return {
+            "success": True,
             "status": self._get_imdb_status_payload(),
         }
 
@@ -1618,12 +1633,16 @@ class MultiRatingsRecommend(_PluginBase):
         rating = None
         if data and data.get("Response") == "True":
             rating = self._normalize_rating(data.get("imdbRating"))
+            if rating is not None:
+                self._imdb_rating_cache[imdb_id] = rating
+                return rating
         elif data and data.get("Error"):
             error_message = str(data.get("Error"))
             if "limit" in error_message.lower():
                 self._set_omdb_block_state(time.time() + 12 * 3600, error_message)
                 logger.warn(f"IMDb 评分接口已触发限额熔断：{error_message}")
-        self._imdb_rating_cache[imdb_id] = rating
+        # Do not cache OMDb misses/limit errors as None.
+        # This avoids stale miss cache keeping IMDb score empty after quota recovers.
         return rating
 
     async def _get_imdb_rating_from_dataset(self, imdb_id: str) -> Optional[float]:

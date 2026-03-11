@@ -26,7 +26,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / TMDB 的低分，缺失时依次回退 IMDb、Bangumi。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.16"
+    plugin_version = "0.6.17"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -322,6 +322,17 @@ class MultiRatingsRecommend(_PluginBase):
             modules[method] = self._make_async_list_handler(method)
         return modules
 
+    def get_actions(self) -> List[Dict[str, Any]]:
+        if not self.get_state():
+            return []
+        return [
+            {
+                "id": "filter_medias_keywords",
+                "name": "过滤媒体关键词",
+                "func": self.action_filter_medias_keywords,
+            }
+        ]
+
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
         return [
             {
@@ -615,6 +626,51 @@ class MultiRatingsRecommend(_PluginBase):
                 }
             )
         return page
+
+    def action_filter_medias_keywords(
+        self,
+        context: Any,
+        include: Optional[str] = None,
+        exclude: Optional[str] = None,
+    ) -> Tuple[bool, Any]:
+        """
+        插件工作流动作：按关键词过滤 context.medias。
+        - include: 命中才保留
+        - exclude: 命中就剔除
+        """
+        medias = list(getattr(context, "medias", []) or [])
+        if not medias:
+            return True, context
+
+        include_re = None
+        exclude_re = None
+        include_pattern = str(include or "").strip()
+        exclude_pattern = str(exclude or "").strip()
+        if include_pattern:
+            try:
+                include_re = re.compile(include_pattern, re.I)
+            except re.error:
+                include_re = re.compile(re.escape(include_pattern), re.I)
+                logger.warn(f"媒体关键词过滤 include 非法正则，已降级字面匹配：{include_pattern}")
+        if exclude_pattern:
+            try:
+                exclude_re = re.compile(exclude_pattern, re.I)
+            except re.error:
+                exclude_re = re.compile(re.escape(exclude_pattern), re.I)
+                logger.warn(f"媒体关键词过滤 exclude 非法正则，已降级字面匹配：{exclude_pattern}")
+
+        kept: List[Any] = []
+        for media in medias:
+            searchable = self._build_media_keyword_text(media)
+            if include_re and not include_re.search(searchable):
+                continue
+            if exclude_re and exclude_re.search(searchable):
+                continue
+            kept.append(media)
+
+        context.medias = kept
+        logger.info(f"媒体关键词过滤后剩余 {len(kept)} 条（原始 {len(medias)} 条）")
+        return True, context
 
     def api_imdb_status(self) -> Dict[str, Any]:
         return self._get_imdb_status_payload()
@@ -2352,6 +2408,27 @@ class MultiRatingsRecommend(_PluginBase):
             getattr(media, "douban_id", None),
             getattr(media, "bangumi_id", None),
         ])
+
+    @staticmethod
+    def _build_media_keyword_text(media: Any) -> str:
+        if not media:
+            return ""
+        keys = (
+            "title",
+            "original_title",
+            "title_year",
+            "year",
+            "overview",
+            "tagline",
+            "source",
+            "type",
+        )
+        parts: List[str] = []
+        for key in keys:
+            value = getattr(media, key, None)
+            if value:
+                parts.append(str(value))
+        return " ".join(parts)
 
     @classmethod
     def _select_primary_rating(cls, ratings: Dict[str, float]) -> Optional[float]:

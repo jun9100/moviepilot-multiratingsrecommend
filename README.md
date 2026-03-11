@@ -14,6 +14,10 @@
 - 详情页评分串（`tagline`）：固定顺序 `TMDB / 豆瓣 / IMDb / Bangumi`
 - 不再向 `overview` 写“当前分/全部评分”提示文案
 - 工作流“过滤媒体数据”读取的也是改写后的 `vote_average`
+- 稳定性闸门（用于 `filter_medias_keywords`）：
+  - 仅当 `vote_count > min_vote_count` 且 `上映天数 > min_days_since_release` 才放行
+  - 若上映日期缺失，则自动降级为只判断 `vote_count > min_vote_count`
+- 工作流 TG 通知：会追加“媒体过滤结果”名单，直接显示过滤后媒体名称
 
 ## 3 分钟上手（推荐给所有用户）
 

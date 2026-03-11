@@ -330,7 +330,7 @@ class MultiRatingsRecommend(_PluginBase):
                 "id": "filter_medias_keywords",
                 "action_id": "filter_medias_keywords",
                 "name": "过滤媒体关键词",
-                "func": self.action_filter_medias_keywords,
+                "func": MultiRatingsRecommend.action_filter_medias_keywords,
             }
         ]
 
@@ -628,8 +628,8 @@ class MultiRatingsRecommend(_PluginBase):
             )
         return page
 
+    @staticmethod
     def action_filter_medias_keywords(
-        self,
         context: Any,
         include: Optional[str] = None,
         exclude: Optional[str] = None,
@@ -662,7 +662,7 @@ class MultiRatingsRecommend(_PluginBase):
 
         kept: List[Any] = []
         for media in medias:
-            searchable = self._build_media_keyword_text(media)
+            searchable = MultiRatingsRecommend._build_media_keyword_text(media)
             if include_re and not include_re.search(searchable):
                 continue
             if exclude_re and exclude_re.search(searchable):

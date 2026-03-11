@@ -17,6 +17,7 @@ from app.chain.media import MediaChain
 from app.chain.recommend import RecommendChain
 from app.core.context import MediaInfo
 from app.log import logger
+from app.schemas import ActionExecution
 from app.modules.themoviedb.tmdbapi import TmdbApi
 from app.plugins import _PluginBase
 from app.schemas.types import MediaType
@@ -27,7 +28,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / TMDB 的低分，缺失时依次回退 IMDb、Bangumi。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.23"
+    plugin_version = "0.6.24"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -771,6 +772,7 @@ class MultiRatingsRecommend(_PluginBase):
         logger.info(
             f"媒体过滤后剩余 {len(kept)} 条（原始 {len(medias)} 条，关键词拦截 {blocked_keyword} 条{guard_text}）"
         )
+        self._append_workflow_preview_history(context=context, medias=kept)
         return True, context
 
     def api_imdb_status(self) -> Dict[str, Any]:
@@ -2658,6 +2660,36 @@ class MultiRatingsRecommend(_PluginBase):
             days_ok = True if days_since_release is None else days_since_release > min_days_since_release
         # 只有两个门槛同时满足才放行，任一不满足都视为不稳定评分
         return not (vote_ok and days_ok)
+
+    @staticmethod
+    def _append_workflow_preview_history(context: Any, medias: Sequence[Any], max_items: int = 20) -> None:
+        """
+        往工作流执行历史追加一条媒体名单，便于发送消息动作直接输出具体名称。
+        """
+        history = getattr(context, "execute_history", None)
+        if not isinstance(history, list):
+            return
+        items: List[str] = []
+        for media in list(medias or [])[:max_items]:
+            title = (
+                getattr(media, "title_year", None)
+                or getattr(media, "title", None)
+                or getattr(media, "original_title", None)
+                or getattr(media, "en_title", None)
+                or f"tmdb:{getattr(media, 'tmdb_id', '-')}"
+            )
+            title = str(title).replace("\n", " ").strip()
+            if title:
+                items.append(title)
+        if not items:
+            message = "媒体名单：0 条"
+        else:
+            message = "媒体名单：" + "、".join(items)
+            if len(medias or []) > len(items):
+                message += f"（其余 {len(medias) - len(items)} 条省略）"
+        if len(message) > 1200:
+            message = f"{message[:1200]}..."
+        history.append(ActionExecution(action="媒体过滤结果", result=True, message=message))
 
     @classmethod
     def _select_primary_rating(cls, ratings: Dict[str, float]) -> Optional[float]:

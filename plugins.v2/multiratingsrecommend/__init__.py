@@ -24,7 +24,7 @@ from app.utils.http import AsyncRequestUtils
 
 class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
-    plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。"
+    plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / IMDb 的低分，缺失时回退 TMDB。"
     plugin_icon = "mdi-shield-half-full"
     plugin_version = "0.6.7"
     plugin_author = "jun9100"
@@ -319,7 +319,7 @@ class MultiRatingsRecommend(_PluginBase):
                 },
                 "text": (
                     "插件会统一改写推荐页、搜索结果、媒体详情和工作流中的评分。"
-                    "卡片右上角优先显示 TMDB / 豆瓣 的低分，两者都缺失时回退 IMDb；"
+                    "卡片右上角优先显示 豆瓣 / IMDb 的低分，两者都缺失时回退 TMDB；"
                     "详情页会在简介上方显示各平台评分串。IMDb 支持本地数据集优先模式；"
                     "豆瓣支持额外配置外部详情 API 兜底。"
                 ),
@@ -568,7 +568,7 @@ class MultiRatingsRecommend(_PluginBase):
                     f"单条超时：{self._list_enrich_timeout:.1f}s；"
                     f"详情超时：{self._item_enrich_timeout:.1f}s；"
                     f"列表并发：{self._LIST_ENRICH_CONCURRENCY}；"
-                    f"主评分策略：TMDB / 豆瓣 取低分，缺失时回退 IMDb"
+                    f"主评分策略：豆瓣 / IMDb 取低分，缺失时回退 TMDB"
                     + (
                         f"；分类缓存：{len(self._list_result_cache)} 条，TTL {self._list_cache_ttl_seconds}s"
                         if self._enable_list_result_cache
@@ -2235,17 +2235,17 @@ class MultiRatingsRecommend(_PluginBase):
 
     @classmethod
     def _select_primary_rating(cls, ratings: Dict[str, float]) -> Optional[float]:
-        tmdb_rating = ratings.get("TMDB")
         douban_rating = ratings.get("豆瓣")
-        if tmdb_rating is not None and douban_rating is not None:
-            return min(tmdb_rating, douban_rating)
-        if tmdb_rating is not None:
-            return tmdb_rating
+        imdb_rating = ratings.get("IMDb")
+        if douban_rating is not None and imdb_rating is not None:
+            return min(douban_rating, imdb_rating)
         if douban_rating is not None:
             return douban_rating
-        imdb_rating = ratings.get("IMDb")
         if imdb_rating is not None:
             return imdb_rating
+        tmdb_rating = ratings.get("TMDB")
+        if tmdb_rating is not None:
+            return tmdb_rating
         bangumi_rating = ratings.get("Bangumi")
         if bangumi_rating is not None:
             return bangumi_rating

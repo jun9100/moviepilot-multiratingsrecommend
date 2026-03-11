@@ -27,7 +27,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / TMDB 的低分，缺失时依次回退 IMDb、Bangumi。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.21"
+    plugin_version = "0.6.22"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -752,6 +752,7 @@ class MultiRatingsRecommend(_PluginBase):
             min_days_since_release,
             default=self._workflow_auto_min_days_since_release,
         )
+        enable_stability_guard = min_vote_threshold > 0 and min_days_threshold > 0
 
         kept, blocked_keyword, blocked_unstable = self._filter_media_list(
             medias,

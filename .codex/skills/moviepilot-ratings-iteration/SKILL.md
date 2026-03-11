@@ -16,8 +16,8 @@ Use this skill when changing rating priority, fallback behavior, or Douban risk 
 - `README.md`
 
 ## Required behavior baseline
-- Card top-right score: use lower of Douban and IMDb when both exist.
-- If Douban and IMDb are both missing, fallback to TMDB.
+- Card top-right score: use lower of Douban and TMDB when both exist.
+- If Douban and TMDB are both missing, fallback to IMDb.
 - If previous three are missing, fallback to Bangumi when the item has Bangumi score.
 - Do not write rating hint text into overview.
 - Detail page tagline must be ratings only, fixed order: `TMDB / Douban / IMDb / Bangumi`.

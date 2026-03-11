@@ -328,6 +328,7 @@ class MultiRatingsRecommend(_PluginBase):
         return [
             {
                 "id": "filter_medias_keywords",
+                "action_id": "filter_medias_keywords",
                 "name": "过滤媒体关键词",
                 "func": self.action_filter_medias_keywords,
             }

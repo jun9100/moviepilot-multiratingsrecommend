@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import time
+from datetime import date, datetime
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -26,7 +27,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / TMDB 的低分，缺失时依次回退 IMDb、Bangumi。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.18"
+    plugin_version = "0.6.19"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -654,11 +655,15 @@ class MultiRatingsRecommend(_PluginBase):
         context: Any,
         include: Optional[str] = None,
         exclude: Optional[str] = None,
+        min_vote_count: Optional[int] = 0,
+        min_days_since_release: Optional[int] = 0,
     ) -> Tuple[bool, Any]:
         """
         插件工作流动作：按关键词过滤 context.medias。
         - include: 命中才保留
         - exclude: 命中就剔除
+        - min_vote_count + min_days_since_release: 新片评分稳定性闸门
+          当媒体距离上映不足 min_days_since_release 且 vote_count < min_vote_count 时剔除
         """
         medias = list(getattr(context, "medias", []) or [])
         if not medias:
@@ -681,17 +686,38 @@ class MultiRatingsRecommend(_PluginBase):
                 exclude_re = re.compile(re.escape(exclude_pattern), re.I)
                 logger.warn(f"媒体关键词过滤 exclude 非法正则，已降级字面匹配：{exclude_pattern}")
 
+        min_vote_threshold = MultiRatingsRecommend._parse_int(min_vote_count, default=0)
+        min_days_threshold = MultiRatingsRecommend._parse_int(min_days_since_release, default=0)
+        enable_stability_guard = min_vote_threshold > 0 and min_days_threshold > 0
+
         kept: List[Any] = []
+        blocked_keyword = 0
+        blocked_unstable = 0
         for media in medias:
             searchable = MultiRatingsRecommend._build_media_keyword_text(media)
             if include_re and not include_re.search(searchable):
                 continue
             if exclude_re and exclude_re.search(searchable):
+                blocked_keyword += 1
+                continue
+            if enable_stability_guard and MultiRatingsRecommend._is_unstable_media_rating(
+                media,
+                min_vote_count=min_vote_threshold,
+                min_days_since_release=min_days_threshold,
+            ):
+                blocked_unstable += 1
                 continue
             kept.append(media)
 
         context.medias = kept
-        logger.info(f"媒体关键词过滤后剩余 {len(kept)} 条（原始 {len(medias)} 条）")
+        guard_text = (
+            f"，不稳定评分拦截 {blocked_unstable} 条（阈值：{min_vote_threshold} 票 / {min_days_threshold} 天）"
+            if enable_stability_guard
+            else ""
+        )
+        logger.info(
+            f"媒体过滤后剩余 {len(kept)} 条（原始 {len(medias)} 条，关键词拦截 {blocked_keyword} 条{guard_text}）"
+        )
         return True, context
 
     def api_imdb_status(self) -> Dict[str, Any]:
@@ -2451,6 +2477,56 @@ class MultiRatingsRecommend(_PluginBase):
             if value:
                 parts.append(str(value))
         return " ".join(parts)
+
+    @staticmethod
+    def _parse_int(value: Any, default: int = 0) -> int:
+        if value in (None, ""):
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _parse_media_date(value: Any) -> Optional[date]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        match = re.search(r"(\\d{4})[-/.](\\d{1,2})[-/.](\\d{1,2})", text)
+        if match:
+            try:
+                return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+            except ValueError:
+                return None
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    @classmethod
+    def _media_days_since_release(cls, media: Any) -> Optional[int]:
+        for key in ("release_date", "first_air_date"):
+            media_date = cls._parse_media_date(getattr(media, key, None))
+            if media_date:
+                return (date.today() - media_date).days
+        return None
+
+    @classmethod
+    def _is_unstable_media_rating(
+        cls,
+        media: Any,
+        min_vote_count: int,
+        min_days_since_release: int,
+    ) -> bool:
+        vote_count = cls._parse_int(getattr(media, "vote_count", 0), default=0)
+        if vote_count >= min_vote_count:
+            return False
+        days_since_release = cls._media_days_since_release(media)
+        if days_since_release is None:
+            return False
+        return days_since_release < min_days_since_release
 
     @classmethod
     def _select_primary_rating(cls, ratings: Dict[str, float]) -> Optional[float]:

@@ -26,7 +26,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 TMDB / 豆瓣 的低分，缺失时回退 IMDb。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.3"
+    plugin_version = "0.6.4"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -98,6 +98,18 @@ class MultiRatingsRecommend(_PluginBase):
     }
     _LIST_ENRICH_CONCURRENCY = 6
     _OMDB_BLOCK_STATE_KEY = "omdb_block_state"
+    _DOUBAN_BLOCK_STATE_KEY = "douban_block_state"
+    _DOUBAN_RATING_STORE_KEY = "douban_rating_store"
+    _DOUBAN_BLOCK_HOURS = 6
+    _DOUBAN_MIN_INTERVAL_SECONDS = 1.2
+    _DOUBAN_RATING_STORE_LIMIT = 5000
+    _DOUBAN_BLOCK_MARKERS = (
+        "error code: 004",
+        "sec.douban.com",
+        "please login and retry",
+        "有异常请求从你的ip发出",
+        "有异常请求从你的 ip 发出",
+    )
     _DIAGNOSTIC_KEEP = 30
     _OVERVIEW_PREFIXES = (
         "当前分：",
@@ -129,6 +141,11 @@ class MultiRatingsRecommend(_PluginBase):
         self._imdb_rating_cache: Dict[str, Optional[float]] = {}
         self._douban_info_cache: Dict[Tuple[str, str, str], Optional[dict]] = {}
         self._douban_web_rating_cache: Dict[str, Optional[float]] = {}
+        self._douban_blocked_until: float = 0
+        self._douban_block_reason: str = ""
+        self._douban_rating_store: Dict[str, Dict[str, Any]] = {}
+        self._douban_rate_lock = Lock()
+        self._douban_next_request_at: float = 0
         self._imdb_blocked_until: float = 0
         self._imdb_block_reason: str = ""
         self._imdb_dataset_status: str = "未启用"
@@ -178,6 +195,8 @@ class MultiRatingsRecommend(_PluginBase):
         except (TypeError, ValueError):
             self._max_items = 30
         self._reset_runtime_cache()
+        self._load_douban_block_state()
+        self._load_douban_rating_store()
         self._load_omdb_block_state()
         self._refresh_imdb_dataset_status()
         self._schedule_imdb_dataset_index_build()
@@ -379,6 +398,7 @@ class MultiRatingsRecommend(_PluginBase):
                     f"最大补分条数：{self._max_items}；"
                     f"列表并发：{self._LIST_ENRICH_CONCURRENCY}；"
                     f"主评分策略：TMDB / 豆瓣 取低分，缺失时回退 IMDb"
+                    + (f"；豆瓣状态：{self._douban_block_reason}" if self._douban_blocked_until > time.time() else "")
                     + (f"；IMDb 数据集：{self._imdb_dataset_status}" if self._enable_imdb else "")
                     + (f"；OMDb 状态：{self._imdb_block_reason}" if self._imdb_blocked_until > time.time() else "")
                 ),
@@ -419,6 +439,10 @@ class MultiRatingsRecommend(_PluginBase):
         self._tmdb_match_cache.clear()
         self._imdb_rating_cache.clear()
         self._douban_info_cache.clear()
+        self._douban_web_rating_cache.clear()
+        self._douban_blocked_until = 0
+        self._douban_block_reason = ""
+        self._douban_next_request_at = 0
         self._imdb_blocked_until = 0
         self._imdb_block_reason = ""
         self._imdb_dataset_meta = {}
@@ -569,6 +593,8 @@ class MultiRatingsRecommend(_PluginBase):
         if source_label and current_rating is not None:
             ratings[source_label] = current_rating
             diagnostic_notes.append(f"初始评分：{source_label} {current_rating:.1f}")
+            if source_label == "豆瓣" and media.douban_id:
+                self._remember_douban_rating(str(media.douban_id), current_rating, "初始评分")
 
         tmdb_detail = await self._resolve_tmdb_detail(media)
         if tmdb_detail:
@@ -769,10 +795,17 @@ class MultiRatingsRecommend(_PluginBase):
         cache_key = ("tmdb", str(tmdb_id), media_type.value if media_type else "")
         if cache_key in self._douban_info_cache:
             return self._douban_info_cache[cache_key]
+        if self._is_douban_blocked():
+            self._douban_info_cache[cache_key] = None
+            return None
         info = self._annotate_douban_info(
-            await self._media_chain.async_get_doubaninfo_by_tmdbid(tmdbid=int(tmdb_id), mtype=media_type),
+            await self._call_douban_service(
+                f"豆瓣TMDB映射:{tmdb_id}",
+                lambda: self._media_chain.async_get_doubaninfo_by_tmdbid(tmdbid=int(tmdb_id), mtype=media_type),
+            ),
             "TMDB映射",
         )
+        self._remember_douban_rating_from_info(info)
         self._douban_info_cache[cache_key] = info
         return info
 
@@ -780,10 +813,17 @@ class MultiRatingsRecommend(_PluginBase):
         cache_key = ("bangumi", str(bangumi_id), "")
         if cache_key in self._douban_info_cache:
             return self._douban_info_cache[cache_key]
+        if self._is_douban_blocked():
+            self._douban_info_cache[cache_key] = None
+            return None
         info = self._annotate_douban_info(
-            await self._media_chain.async_get_doubaninfo_by_bangumiid(bangumiid=int(bangumi_id)),
+            await self._call_douban_service(
+                f"豆瓣Bangumi映射:{bangumi_id}",
+                lambda: self._media_chain.async_get_doubaninfo_by_bangumiid(bangumiid=int(bangumi_id)),
+            ),
             "Bangumi映射",
         )
+        self._remember_douban_rating_from_info(info)
         self._douban_info_cache[cache_key] = info
         return info
 
@@ -796,46 +836,63 @@ class MultiRatingsRecommend(_PluginBase):
         cache_key = ("id", str(douban_id), media_type.value if media_type else "")
         if cache_key in self._douban_info_cache:
             return self._douban_info_cache[cache_key]
-        info = self._annotate_douban_info(
-            await self.chain.async_douban_info(doubanid=str(douban_id), mtype=media_type, raise_exception=False),
-            "内置详情",
-        )
-        if not info and media_type:
-            fallback_key = ("id", str(douban_id), "")
-            if fallback_key in self._douban_info_cache:
-                info = self._douban_info_cache[fallback_key]
-            else:
-                info = self._annotate_douban_info(
-                    await self.chain.async_douban_info(doubanid=str(douban_id), mtype=None, raise_exception=False),
-                    "内置详情",
+        cached_info = self._build_cached_douban_info(str(douban_id))
+        info = cached_info
+
+        if not self._is_douban_blocked():
+            detail_info = self._annotate_douban_info(
+                await self._call_douban_service(
+                    f"豆瓣详情:{douban_id}",
+                    lambda: self.chain.async_douban_info(doubanid=str(douban_id), mtype=media_type, raise_exception=False),
+                ),
+                "内置详情",
+            )
+            info = self._prefer_douban_info(info, detail_info)
+            if not detail_info and media_type:
+                fallback_key = ("id", str(douban_id), "")
+                if fallback_key in self._douban_info_cache:
+                    info = self._prefer_douban_info(info, self._douban_info_cache[fallback_key])
+                else:
+                    fallback_info = self._annotate_douban_info(
+                        await self._call_douban_service(
+                            f"豆瓣详情(无类型):{douban_id}",
+                            lambda: self.chain.async_douban_info(doubanid=str(douban_id), mtype=None, raise_exception=False),
+                        ),
+                        "内置详情",
+                    )
+                    self._douban_info_cache[fallback_key] = fallback_info
+                    info = self._prefer_douban_info(info, fallback_info)
+
+            if not info or self._extract_douban_rating(info) is None:
+                recognized = await self._async_call_system_method_excluding_self(
+                    "async_recognize_media",
+                    doubanid=str(douban_id),
+                    mtype=media_type,
+                    cache=False,
                 )
-                self._douban_info_cache[fallback_key] = info
-        if not info or self._extract_douban_rating(info) is None:
-            recognized = await self._async_call_system_method_excluding_self(
-                "async_recognize_media",
-                doubanid=str(douban_id),
-                mtype=media_type,
-                cache=False,
-            )
-            recognized_info = self._annotate_douban_info(
-                getattr(recognized, "douban_info", None) if recognized else None,
-                "豆瓣识别",
-            )
-            info = self._prefer_douban_info(info, recognized_info)
-        if not info or self._extract_douban_rating(info) is None:
-            web_rating = await self._get_douban_web_rating_by_id(str(douban_id))
-            if web_rating is not None:
-                base = dict(info or {})
-                base["id"] = str(base.get("id") or douban_id)
-                rating = base.get("rating") if isinstance(base.get("rating"), dict) else {}
-                rating["value"] = web_rating
-                base["rating"] = rating
-                info = self._annotate_douban_info(base, "豆瓣网页")
+                recognized_info = self._annotate_douban_info(
+                    getattr(recognized, "douban_info", None) if recognized else None,
+                    "豆瓣识别",
+                )
+                info = self._prefer_douban_info(info, recognized_info)
+
+            if not info or self._extract_douban_rating(info) is None:
+                web_rating = await self._get_douban_web_rating_by_id(str(douban_id))
+                if web_rating is not None:
+                    base = dict(info or {})
+                    base["id"] = str(base.get("id") or douban_id)
+                    rating = base.get("rating") if isinstance(base.get("rating"), dict) else {}
+                    rating["value"] = web_rating
+                    base["rating"] = rating
+                    info = self._annotate_douban_info(base, "豆瓣网页")
+        if (not info or self._extract_douban_rating(info) is None) and cached_info:
+            info = self._prefer_douban_info(info, cached_info)
         if (not info or self._extract_douban_rating(info) is None) and self._enable_external_douban:
             external_info = await self._get_external_douban_info_by_id(str(douban_id), media_type, media)
             info = self._prefer_douban_info(info, external_info)
         if info and not info.get("id"):
             info["id"] = str(douban_id)
+        self._remember_douban_rating_from_info(info)
         self._douban_info_cache[cache_key] = info
         return info
 
@@ -845,6 +902,12 @@ class MultiRatingsRecommend(_PluginBase):
             return None
         if douban_id in self._douban_web_rating_cache:
             return self._douban_web_rating_cache[douban_id]
+        cached_info = self._build_cached_douban_info(douban_id)
+        cached_rating = self._extract_douban_rating(cached_info)
+        if self._is_douban_blocked():
+            self._douban_web_rating_cache[douban_id] = cached_rating
+            return cached_rating
+        await self._wait_douban_slot()
         url = f"https://movie.douban.com/subject/{douban_id}/"
         try:
             html = await AsyncRequestUtils(
@@ -861,15 +924,27 @@ class MultiRatingsRecommend(_PluginBase):
                 cookies=self._douban_web_cookie or None,
             ).get(url)
             if not html:
+                if cached_rating is not None:
+                    self._douban_web_rating_cache[douban_id] = cached_rating
+                    return cached_rating
                 self._douban_web_rating_cache[douban_id] = None
                 return None
+            if self._is_douban_block_message(html):
+                self._trip_douban_block(f"豆瓣网页:{douban_id}")
+                self._douban_web_rating_cache[douban_id] = cached_rating
+                return cached_rating
             rating = self._extract_douban_rating_from_html(html)
+            if rating is not None:
+                self._remember_douban_rating(douban_id, rating, "豆瓣网页")
             self._douban_web_rating_cache[douban_id] = rating
             return rating
         except Exception as err:
-            logger.warn(f"豆瓣网页评分获取失败：{douban_id} - {err}")
-            self._douban_web_rating_cache[douban_id] = None
-            return None
+            if self._is_douban_block_message(str(err)):
+                self._trip_douban_block(f"豆瓣网页:{douban_id}：{err}")
+            else:
+                logger.warn(f"豆瓣网页评分获取失败：{douban_id} - {err}")
+            self._douban_web_rating_cache[douban_id] = cached_rating
+            return cached_rating
 
     @classmethod
     def _extract_douban_rating_from_html(cls, html: str) -> Optional[float]:
@@ -897,6 +972,9 @@ class MultiRatingsRecommend(_PluginBase):
         )
         if cache_key in self._douban_info_cache:
             return self._douban_info_cache[cache_key]
+        if self._is_douban_blocked():
+            self._douban_info_cache[cache_key] = None
+            return None
         info = None
         media_type = self._get_media_type(media.type)
         for title in titles or [media.title or ""]:
@@ -908,29 +986,30 @@ class MultiRatingsRecommend(_PluginBase):
                 imdb_id=imdb_id,
             )
             for attempt in attempts:
-                try:
-                    matched = await self.chain.async_match_doubaninfo(
+                matched = await self._call_douban_service(
+                    f"豆瓣匹配:{attempt['title']}",
+                    lambda attempt=attempt: self.chain.async_match_doubaninfo(
                         name=attempt["title"],
                         imdbid=attempt["imdbid"],
                         mtype=attempt["media_type"],
                         year=attempt["year"],
                         season=attempt["season"],
                         raise_exception=False,
-                    )
-                    matched = self._annotate_douban_info(matched, attempt["source"])
-                    douban_id = matched.get("id") if matched else None
-                    if douban_id:
-                        detail = await self._get_douban_info_by_id(str(douban_id), media_type, media)
-                        if detail:
-                            if not detail.get("id"):
-                                detail["id"] = str(douban_id)
-                            matched = self._prefer_douban_info(matched, detail)
-                    info = self._prefer_douban_info(info, matched)
-                    if info and self._extract_douban_rating(info) is not None:
-                        self._douban_info_cache[cache_key] = info
-                        return info
-                except Exception as err:
-                    logger.warn(f"豆瓣评分补充失败：{attempt['title']} - {err}")
+                    ),
+                )
+                matched = self._annotate_douban_info(matched, attempt["source"])
+                douban_id = matched.get("id") if matched else None
+                if douban_id:
+                    detail = await self._get_douban_info_by_id(str(douban_id), media_type, media)
+                    if detail:
+                        if not detail.get("id"):
+                            detail["id"] = str(douban_id)
+                        matched = self._prefer_douban_info(matched, detail)
+                info = self._prefer_douban_info(info, matched)
+                self._remember_douban_rating_from_info(info)
+                if info and self._extract_douban_rating(info) is not None:
+                    self._douban_info_cache[cache_key] = info
+                    return info
         self._douban_info_cache[cache_key] = info
         return info
 
@@ -1009,6 +1088,7 @@ class MultiRatingsRecommend(_PluginBase):
             info = self._normalize_external_douban_info(payload, douban_id)
             if info:
                 self._external_douban_status = "已配置且可用"
+                self._remember_douban_rating_from_info(info)
                 self._douban_info_cache[cache_key] = info
                 return info
             self._external_douban_status = "已配置但未返回有效详情"
@@ -1250,6 +1330,188 @@ class MultiRatingsRecommend(_PluginBase):
             encoding="utf-8",
         )
 
+    def _load_douban_block_state(self):
+        data = self.get_data(self._DOUBAN_BLOCK_STATE_KEY) or {}
+        blocked_until = float(data.get("blocked_until") or 0)
+        if blocked_until > time.time():
+            self._douban_blocked_until = blocked_until
+            self._douban_block_reason = str(data.get("reason") or "命中豆瓣风控")
+            return
+        self._clear_douban_block_state()
+
+    def _set_douban_block_state(self, blocked_until: float, reason: str):
+        reason_text = str(reason or "").strip() or "命中豆瓣风控"
+        self._douban_blocked_until = blocked_until
+        self._douban_block_reason = reason_text
+        self.save_data(
+            self._DOUBAN_BLOCK_STATE_KEY,
+            {
+                "blocked_until": blocked_until,
+                "reason": reason_text,
+            },
+        )
+
+    def _clear_douban_block_state(self):
+        self._douban_blocked_until = 0
+        self._douban_block_reason = ""
+        self.del_data(self._DOUBAN_BLOCK_STATE_KEY)
+
+    def _is_douban_blocked(self) -> bool:
+        if self._douban_blocked_until and self._douban_blocked_until <= time.time():
+            self._clear_douban_block_state()
+            return False
+        return self._douban_blocked_until > time.time()
+
+    @classmethod
+    def _is_douban_block_message(cls, text: str) -> bool:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return False
+        compact = lowered.replace(" ", "")
+        for marker in cls._DOUBAN_BLOCK_MARKERS:
+            marker_lower = marker.lower()
+            marker_compact = marker_lower.replace(" ", "")
+            if marker_lower in lowered or marker_compact in compact:
+                return True
+        return False
+
+    @classmethod
+    def _payload_contains_douban_block(cls, payload: Any) -> bool:
+        if payload in (None, ""):
+            return False
+        if isinstance(payload, (dict, list, tuple)):
+            try:
+                text = json.dumps(payload, ensure_ascii=False)
+            except Exception:
+                text = str(payload)
+        else:
+            text = str(payload)
+        return cls._is_douban_block_message(text)
+
+    def _trip_douban_block(self, reason: str):
+        blocked_until = time.time() + self._DOUBAN_BLOCK_HOURS * 3600
+        self._set_douban_block_state(blocked_until, reason)
+        logger.warn(f"检测到豆瓣风控，熔断 {self._DOUBAN_BLOCK_HOURS} 小时：{reason}")
+
+    async def _wait_douban_slot(self):
+        interval = max(float(self._DOUBAN_MIN_INTERVAL_SECONDS), 0)
+        if interval <= 0:
+            return
+        while True:
+            now = time.monotonic()
+            with self._douban_rate_lock:
+                if now >= self._douban_next_request_at:
+                    self._douban_next_request_at = now + interval
+                    return
+                wait_seconds = self._douban_next_request_at - now
+            await asyncio.sleep(min(max(wait_seconds, 0), interval))
+
+    async def _call_douban_service(self, context: str, request_fn):
+        if self._is_douban_blocked():
+            return None
+        await self._wait_douban_slot()
+        try:
+            payload = await request_fn()
+        except Exception as err:
+            if self._is_douban_block_message(str(err)):
+                self._trip_douban_block(f"{context}：{err}")
+            else:
+                logger.warn(f"{context} 失败：{err}")
+            return None
+        if self._payload_contains_douban_block(payload):
+            self._trip_douban_block(f"{context}：返回风控页面")
+            return None
+        return payload
+
+    def _load_douban_rating_store(self):
+        data = self.get_data(self._DOUBAN_RATING_STORE_KEY) or {}
+        store: Dict[str, Dict[str, Any]] = {}
+        if isinstance(data, dict):
+            for raw_id, raw_value in data.items():
+                douban_id = str(raw_id or "").strip()
+                if not douban_id:
+                    continue
+                rating = None
+                updated_at = 0
+                source = ""
+                if isinstance(raw_value, dict):
+                    rating = self._normalize_rating(raw_value.get("rating"))
+                    try:
+                        updated_at = int(raw_value.get("updated_at") or 0)
+                    except (TypeError, ValueError):
+                        updated_at = 0
+                    source = str(raw_value.get("source") or "")
+                else:
+                    rating = self._normalize_rating(raw_value)
+                if rating is None:
+                    continue
+                store[douban_id] = {
+                    "rating": rating,
+                    "updated_at": updated_at,
+                    "source": source,
+                }
+        self._douban_rating_store = store
+        self._trim_douban_rating_store()
+
+    def _trim_douban_rating_store(self):
+        if len(self._douban_rating_store) <= self._DOUBAN_RATING_STORE_LIMIT:
+            return
+        ordered_items = sorted(
+            self._douban_rating_store.items(),
+            key=lambda item: int(item[1].get("updated_at") or 0),
+            reverse=True,
+        )
+        self._douban_rating_store = dict(ordered_items[: self._DOUBAN_RATING_STORE_LIMIT])
+
+    def _save_douban_rating_store(self):
+        if not self._douban_rating_store:
+            self.del_data(self._DOUBAN_RATING_STORE_KEY)
+            return
+        self.save_data(self._DOUBAN_RATING_STORE_KEY, self._douban_rating_store)
+
+    def _remember_douban_rating(self, douban_id: str, rating: Any, source: str = ""):
+        normalized_rating = self._normalize_rating(rating)
+        douban_id = str(douban_id or "").strip()
+        if not douban_id or normalized_rating is None:
+            return
+        old_value = self._douban_rating_store.get(douban_id)
+        source_text = str(source or "").strip()
+        if old_value and old_value.get("rating") == normalized_rating and old_value.get("source") == source_text:
+            return
+        self._douban_rating_store[douban_id] = {
+            "rating": normalized_rating,
+            "updated_at": int(time.time()),
+            "source": source_text,
+        }
+        self._trim_douban_rating_store()
+        self._save_douban_rating_store()
+
+    def _remember_douban_rating_from_info(self, info: Optional[dict]):
+        if not info:
+            return
+        douban_id = str(info.get("id") or "").strip()
+        rating = self._extract_douban_rating(info)
+        if douban_id and rating is not None:
+            self._remember_douban_rating(douban_id, rating, str(info.get("__mr_source") or "未知来源"))
+
+    def _build_cached_douban_info(self, douban_id: str) -> Optional[dict]:
+        douban_id = str(douban_id or "").strip()
+        if not douban_id:
+            return None
+        record = self._douban_rating_store.get(douban_id)
+        if not isinstance(record, dict):
+            return None
+        rating = self._normalize_rating(record.get("rating"))
+        if rating is None:
+            return None
+        return self._annotate_douban_info(
+            {
+                "id": douban_id,
+                "rating": {"value": rating},
+            },
+            "本地缓存",
+        )
+
     def _load_omdb_block_state(self):
         data = self.get_data(self._OMDB_BLOCK_STATE_KEY) or {}
         blocked_until = float(data.get("blocked_until") or 0)
@@ -1283,6 +1545,10 @@ class MultiRatingsRecommend(_PluginBase):
             "imdb_source": self._imdb_source,
             "external_douban_enabled": self._enable_external_douban,
             "external_douban_status": self._external_douban_status,
+            "douban_blocked": self._douban_blocked_until > time.time(),
+            "douban_blocked_until": int(self._douban_blocked_until) if self._douban_blocked_until else 0,
+            "douban_block_reason": self._douban_block_reason,
+            "douban_rating_store_size": len(self._douban_rating_store),
             "dataset_path": self._imdb_ratings_path,
             "dataset_status": self._imdb_dataset_status,
             "dataset_building": self._imdb_dataset_building,

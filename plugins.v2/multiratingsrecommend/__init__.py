@@ -26,7 +26,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / TMDB 的低分，缺失时依次回退 IMDb、Bangumi。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.13"
+    plugin_version = "0.6.14"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -801,7 +801,7 @@ class MultiRatingsRecommend(_PluginBase):
         except Exception as err:
             logger.warn(f"详情补分失败，降级原始详情：{original.title or original.tmdb_id or method} - {err}")
         original.overview = self._strip_rating_overview(original.overview)
-        original.tagline = ""
+        original.tagline = self._fallback_rating_tagline(original)
         return original
 
     async def _handle_async_media_item(self, method: str, *args, **kwargs):
@@ -821,7 +821,7 @@ class MultiRatingsRecommend(_PluginBase):
         except Exception as err:
             logger.warn(f"详情补分失败，降级原始详情：{original.title or original.tmdb_id or method} - {err}")
         original.overview = self._strip_rating_overview(original.overview)
-        original.tagline = ""
+        original.tagline = self._fallback_rating_tagline(original)
         return original
 
     def _handle_sync_media_list(self, method: str, *args, **kwargs):
@@ -930,7 +930,7 @@ class MultiRatingsRecommend(_PluginBase):
                     except Exception as err:
                         logger.warn(f"列表补分失败，降级原始评分：{original.title or original.tmdb_id or index} - {err}")
                     original.overview = self._strip_rating_overview(original.overview)
-                    original.tagline = ""
+                    original.tagline = self._fallback_rating_tagline(original)
                     return original
 
             enriched_items = await asyncio.gather(*(_enrich_with_limit(index) for index in range(target_count)))
@@ -2449,6 +2449,25 @@ class MultiRatingsRecommend(_PluginBase):
     def _merge_rating_tagline(cls, ratings: List[Tuple[str, float]]) -> str:
         rating_line = " / ".join(f"{label} {value:.1f}" for label, value in ratings)
         return rating_line
+
+    @classmethod
+    def _fallback_rating_tagline(cls, media: Optional[MediaInfo]) -> str:
+        if not media:
+            return ""
+        ratings: Dict[str, float] = {}
+        source_label = cls._source_label(media)
+        current_rating = cls._normalize_rating(getattr(media, "vote_average", None))
+        if source_label and current_rating is not None:
+            ratings[source_label] = current_rating
+        bangumi_rating = cls._extract_bangumi_media_rating(
+            media,
+            fallback_rating=current_rating if source_label == "Bangumi" else None,
+        )
+        if bangumi_rating is not None and ratings.get("Bangumi") is None:
+            ratings["Bangumi"] = bangumi_rating
+        if not ratings:
+            return ""
+        return cls._merge_rating_tagline(cls._display_ratings(ratings))
 
     @classmethod
     def _strip_rating_tagline(cls, tagline: Optional[str]) -> str:

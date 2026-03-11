@@ -22,6 +22,23 @@ from app.schemas.types import MediaType
 from app.utils.http import AsyncRequestUtils
 
 
+class _WorkflowActionCallable:
+    """
+    可调用且可被 workflow/plugin/actions 接口安全序列化的包装器。
+    FastAPI 在编码未知对象时会尝试 dict(obj)，这里通过 __iter__ 返回空映射，
+    避免把函数对象本身写入 JSON（否则会触发 500）。
+    """
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def __call__(self, context: Any, **kwargs):
+        return self._fn(context, **kwargs)
+
+    def __iter__(self):
+        return iter(())
+
+
 class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / TMDB 的低分，缺失时依次回退 IMDb、Bangumi。"
@@ -330,7 +347,7 @@ class MultiRatingsRecommend(_PluginBase):
                 "id": "filter_medias_keywords",
                 "action_id": "filter_medias_keywords",
                 "name": "过滤媒体关键词",
-                "func": MultiRatingsRecommend.action_filter_medias_keywords,
+                "func": _WorkflowActionCallable(MultiRatingsRecommend.action_filter_medias_keywords),
             }
         ]
 

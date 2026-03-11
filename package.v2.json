@@ -1,14 +1,17 @@
 {
   "MultiRatingsRecommend": {
     "name": "全平台低分保护",
-    "description": "统一接管 MoviePilot 的推荐、搜索、识别结果评分，主评分取 豆瓣 / IMDb 的低分，缺失时回退 TMDB。",
+    "description": "统一接管 MoviePilot 的推荐、搜索、识别结果评分，主评分取 豆瓣 / IMDb 的低分，缺失时依次回退 TMDB、Bangumi。",
     "labels": "推荐,搜索,TMDB,IMDb,豆瓣,Bangumi,评分",
-    "version": "0.6.9",
+    "version": "0.6.12",
     "icon": "Moviepilot_A.png",
     "author": "jun9100",
     "level": 1,
     "release": false,
     "history": {
+      "v0.6.12": "恢复主评分策略为“豆瓣/IMDb 取低分 -> TMDB -> Bangumi”；新增从豆瓣详情提取 imdb_id 的补强，修复部分列表卡片未命中 IMDb 导致主评分偏高的问题。豆瓣网页兜底新增“无评分条目冷却”与缓存优先，减少重复网页请求以降低风控风险。",
+      "v0.6.11": "新增 Bangumi 优先策略：条目命中 Bangumi 评分时直接使用 Bangumi，不再计算 TMDB/豆瓣/IMDb；其余条目继续按“豆瓣/IMDb 低分 -> TMDB”处理，并同步状态文案。",
+      "v0.6.10": "主评分策略补齐 Bangumi 最后回退；详情/配置页文案同步为“豆瓣/IMDb 低分 -> TMDB -> Bangumi”；补强 Bangumi 评分读取，确保前三者缺失时可继续回退。",
       "v0.6.9": "修正插件内部版本号与仓库版本号不一致导致的“已更新仍提示可更新”问题。",
       "v0.6.8": "调整主评分策略为“豆瓣/IMDb 取低分，缺失时回退 TMDB”；修正配置页与状态页文案，避免与实际策略不一致。",
       "v0.6.7": "新增详情补分超时降级，避免媒体详情页空白；新增推荐分类服务端缓存（按分类+分页键缓存）、启动预热与分类级增量刷新，降低隐私模式下骨架屏长时间不消失的问题。",

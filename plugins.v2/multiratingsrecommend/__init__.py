@@ -24,9 +24,9 @@ from app.utils.http import AsyncRequestUtils
 
 class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
-    plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / IMDb 的低分，缺失时回退 TMDB。"
+    plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / IMDb 的低分，缺失时依次回退 TMDB、Bangumi。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.9"
+    plugin_version = "0.6.12"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -101,9 +101,12 @@ class MultiRatingsRecommend(_PluginBase):
     _DOUBAN_BLOCK_STATE_KEY = "douban_block_state"
     _DOUBAN_RATING_STORE_KEY = "douban_rating_store"
     _DOUBAN_WEB_QUOTA_KEY = "douban_web_quota"
+    _DOUBAN_WEB_MISS_STATE_KEY = "douban_web_miss_state"
     _DOUBAN_BLOCK_HOURS = 6
     _DOUBAN_MIN_INTERVAL_SECONDS = 1.2
     _DOUBAN_RATING_STORE_LIMIT = 5000
+    _DOUBAN_WEB_MISS_STORE_LIMIT = 5000
+    _DOUBAN_WEB_MISS_COOLDOWN_SECONDS = 24 * 3600
     _LIST_RESULT_CACHE_MAX_ENTRIES = 120
     _PREWARM_LIST_METHODS = (
         "tmdb_trending",
@@ -174,6 +177,7 @@ class MultiRatingsRecommend(_PluginBase):
         self._douban_web_quota_lock = Lock()
         self._douban_web_quota_date: str = ""
         self._douban_web_quota_count: int = 0
+        self._douban_web_miss_state: Dict[str, int] = {}
         self._list_cache_lock = Lock()
         self._list_result_cache: Dict[str, Dict[str, Any]] = {}
         self._list_prewarm_thread: Optional[Thread] = None
@@ -263,6 +267,7 @@ class MultiRatingsRecommend(_PluginBase):
         self._load_douban_block_state()
         self._load_douban_rating_store()
         self._load_douban_web_quota_state()
+        self._load_douban_web_miss_state()
         self._load_omdb_block_state()
         self._refresh_imdb_dataset_status()
         self._schedule_imdb_dataset_index_build()
@@ -319,7 +324,7 @@ class MultiRatingsRecommend(_PluginBase):
                 },
                 "text": (
                     "插件会统一改写推荐页、搜索结果、媒体详情和工作流中的评分。"
-                    "卡片右上角优先显示 豆瓣 / IMDb 的低分，两者都缺失时回退 TMDB；"
+                    "卡片右上角优先显示 豆瓣 / IMDb 的低分，两者都缺失时回退 TMDB，再回退 Bangumi；"
                     "详情页会在简介上方显示各平台评分串。IMDb 支持本地数据集优先模式；"
                     "豆瓣支持额外配置外部详情 API 兜底。"
                 ),
@@ -568,7 +573,7 @@ class MultiRatingsRecommend(_PluginBase):
                     f"单条超时：{self._list_enrich_timeout:.1f}s；"
                     f"详情超时：{self._item_enrich_timeout:.1f}s；"
                     f"列表并发：{self._LIST_ENRICH_CONCURRENCY}；"
-                    f"主评分策略：豆瓣 / IMDb 取低分，缺失时回退 TMDB"
+                    f"主评分策略：豆瓣 / IMDb 取低分，缺失时依次回退 TMDB、Bangumi"
                     + (
                         f"；分类缓存：{len(self._list_result_cache)} 条，TTL {self._list_cache_ttl_seconds}s"
                         if self._enable_list_result_cache
@@ -967,6 +972,10 @@ class MultiRatingsRecommend(_PluginBase):
                 douban_id = douban_info.get("id")
                 if douban_id:
                     media.douban_id = str(douban_id)
+                imdb_id_from_douban = self._extract_douban_imdb_id(douban_info)
+                if imdb_id_from_douban and not media.imdb_id:
+                    media.imdb_id = imdb_id_from_douban
+                    diagnostic_notes.append(f"IMDb ID：来自豆瓣 {imdb_id_from_douban}")
                 douban_rating = self._extract_douban_rating(douban_info)
                 if douban_rating is not None:
                     ratings["豆瓣"] = douban_rating
@@ -994,6 +1003,14 @@ class MultiRatingsRecommend(_PluginBase):
         elif self._enable_imdb:
             diagnostic_notes.append("IMDb：无 imdb_id")
 
+        bangumi_rating = self._extract_bangumi_media_rating(
+            media,
+            fallback_rating=current_rating if source_label == "Bangumi" else None,
+        )
+        if bangumi_rating is not None and ratings.get("Bangumi") is None:
+            ratings["Bangumi"] = bangumi_rating
+            diagnostic_notes.append(f"Bangumi：{bangumi_rating:.1f}")
+
         if not ratings:
             self._record_diagnostic(media, ratings, None, diagnostic_notes)
             return media
@@ -1002,7 +1019,7 @@ class MultiRatingsRecommend(_PluginBase):
         display_ratings = self._display_ratings(ratings)
         if primary_rating is not None:
             media.vote_average = primary_rating
-        media.tagline = self._merge_rating_tagline(display_ratings, media.tagline)
+        media.tagline = self._merge_rating_tagline(display_ratings)
         if primary_rating is not None:
             diagnostic_notes.append(f"主评分：{primary_rating:.1f}")
         self._record_diagnostic(media, ratings, primary_rating, diagnostic_notes)
@@ -1281,6 +1298,12 @@ class MultiRatingsRecommend(_PluginBase):
             return self._douban_web_rating_cache[douban_id]
         cached_info = self._build_cached_douban_info(douban_id)
         cached_rating = self._extract_douban_rating(cached_info)
+        if cached_rating is not None:
+            self._douban_web_rating_cache[douban_id] = cached_rating
+            return cached_rating
+        if self._is_recent_douban_web_miss(douban_id):
+            self._douban_web_rating_cache[douban_id] = None
+            return None
         if not self._should_use_douban_web_fallback(enrich_context=enrich_context):
             self._douban_web_rating_cache[douban_id] = cached_rating
             return cached_rating
@@ -1310,6 +1333,7 @@ class MultiRatingsRecommend(_PluginBase):
                 if cached_rating is not None:
                     self._douban_web_rating_cache[douban_id] = cached_rating
                     return cached_rating
+                self._mark_douban_web_miss(douban_id)
                 self._douban_web_rating_cache[douban_id] = None
                 return None
             if self._is_douban_block_message(html):
@@ -1319,6 +1343,9 @@ class MultiRatingsRecommend(_PluginBase):
             rating = self._extract_douban_rating_from_html(html)
             if rating is not None:
                 self._remember_douban_rating(douban_id, rating, "豆瓣网页")
+                self._clear_douban_web_miss(douban_id)
+            else:
+                self._mark_douban_web_miss(douban_id)
             self._douban_web_rating_cache[douban_id] = rating
             return rating
         except Exception as err:
@@ -1326,6 +1353,7 @@ class MultiRatingsRecommend(_PluginBase):
                 self._trip_douban_block(f"豆瓣网页:{douban_id}：{err}")
             else:
                 logger.warn(f"豆瓣网页评分获取失败：{douban_id} - {err}")
+                self._mark_douban_web_miss(douban_id)
             self._douban_web_rating_cache[douban_id] = cached_rating
             return cached_rating
 
@@ -1863,6 +1891,23 @@ class MultiRatingsRecommend(_PluginBase):
             self._douban_web_quota_count = 0
         self._sync_douban_web_quota_date()
 
+    def _load_douban_web_miss_state(self):
+        data = self.get_data(self._DOUBAN_WEB_MISS_STATE_KEY) or {}
+        state: Dict[str, int] = {}
+        if isinstance(data, dict):
+            for raw_id, raw_ts in data.items():
+                douban_id = str(raw_id or "").strip()
+                if not douban_id:
+                    continue
+                try:
+                    ts = int(raw_ts or 0)
+                except (TypeError, ValueError):
+                    ts = 0
+                if ts > 0:
+                    state[douban_id] = ts
+        self._douban_web_miss_state = state
+        self._trim_douban_web_miss_state()
+
     def _save_douban_web_quota_state(self):
         self.save_data(
             self._DOUBAN_WEB_QUOTA_KEY,
@@ -1871,6 +1916,12 @@ class MultiRatingsRecommend(_PluginBase):
                 "count": self._douban_web_quota_count,
             },
         )
+
+    def _save_douban_web_miss_state(self):
+        if not self._douban_web_miss_state:
+            self.del_data(self._DOUBAN_WEB_MISS_STATE_KEY)
+            return
+        self.save_data(self._DOUBAN_WEB_MISS_STATE_KEY, self._douban_web_miss_state)
 
     @staticmethod
     def _today_str() -> str:
@@ -1901,6 +1952,42 @@ class MultiRatingsRecommend(_PluginBase):
             reverse=True,
         )
         self._douban_rating_store = dict(ordered_items[: self._DOUBAN_RATING_STORE_LIMIT])
+
+    def _trim_douban_web_miss_state(self):
+        if not self._douban_web_miss_state:
+            return
+        now = int(time.time())
+        threshold = max(now - self._DOUBAN_WEB_MISS_COOLDOWN_SECONDS, 0)
+        active = {
+            key: ts for key, ts in self._douban_web_miss_state.items()
+            if int(ts or 0) >= threshold
+        }
+        if len(active) > self._DOUBAN_WEB_MISS_STORE_LIMIT:
+            ordered_items = sorted(active.items(), key=lambda item: int(item[1] or 0), reverse=True)
+            active = dict(ordered_items[: self._DOUBAN_WEB_MISS_STORE_LIMIT])
+        self._douban_web_miss_state = active
+
+    def _is_recent_douban_web_miss(self, douban_id: str) -> bool:
+        ts = int(self._douban_web_miss_state.get(str(douban_id or "").strip()) or 0)
+        if ts <= 0:
+            return False
+        return (int(time.time()) - ts) < self._DOUBAN_WEB_MISS_COOLDOWN_SECONDS
+
+    def _mark_douban_web_miss(self, douban_id: str):
+        key = str(douban_id or "").strip()
+        if not key:
+            return
+        self._douban_web_miss_state[key] = int(time.time())
+        self._trim_douban_web_miss_state()
+        self._save_douban_web_miss_state()
+
+    def _clear_douban_web_miss(self, douban_id: str):
+        key = str(douban_id or "").strip()
+        if not key:
+            return
+        if key in self._douban_web_miss_state:
+            self._douban_web_miss_state.pop(key, None)
+            self._save_douban_web_miss_state()
 
     def _save_douban_rating_store(self):
         if not self._douban_rating_store:
@@ -2182,7 +2269,7 @@ class MultiRatingsRecommend(_PluginBase):
             "time": time.strftime("%m-%d %H:%M:%S", time.localtime()),
             "title": media.title or media.original_title or media.en_title or "未知条目",
             "ids": f"tmdb:{media.tmdb_id or '-'} douban:{media.douban_id or '-'} imdb:{media.imdb_id or '-'} bgm:{media.bangumi_id or '-'}",
-            "ratings": self._merge_rating_tagline(self._display_ratings(ratings), None) if ratings else "无评分",
+            "ratings": self._merge_rating_tagline(self._display_ratings(ratings)) if ratings else "无评分",
             "primary": f"{primary_rating:.1f}" if primary_rating is not None else "-",
             "notes": "；".join(note for note in notes if note),
         }
@@ -2303,6 +2390,55 @@ class MultiRatingsRecommend(_PluginBase):
         return MultiRatingsRecommend._normalize_rating(rating.get("value"))
 
     @classmethod
+    def _extract_douban_imdb_id(cls, douban_info: Optional[dict]) -> Optional[str]:
+        if not isinstance(douban_info, dict):
+            return None
+        for key in ("imdb", "imdb_id", "imdbid", "imdbId"):
+            imdb_id = cls._normalize_imdb_id(douban_info.get(key))
+            if imdb_id:
+                return imdb_id
+        return None
+
+    @staticmethod
+    def _normalize_imdb_id(value: Any) -> Optional[str]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        matched = re.search(r"(tt\d{5,})", text, flags=re.IGNORECASE)
+        if matched:
+            return matched.group(1).lower()
+        return None
+
+    @classmethod
+    def _extract_bangumi_media_rating(
+        cls,
+        media: Optional[MediaInfo],
+        fallback_rating: Optional[float] = None,
+    ) -> Optional[float]:
+        if not media:
+            return None
+        bangumi_info = getattr(media, "bangumi_info", None)
+        if isinstance(bangumi_info, dict):
+            rating = bangumi_info.get("rating")
+            if isinstance(rating, dict):
+                for key in ("score", "value", "average"):
+                    normalized = cls._normalize_rating(rating.get(key))
+                    if normalized is not None:
+                        return normalized
+            else:
+                normalized = cls._normalize_rating(rating)
+                if normalized is not None:
+                    return normalized
+            for key in ("score", "average_score", "average", "vote_average"):
+                normalized = cls._normalize_rating(bangumi_info.get(key))
+                if normalized is not None:
+                    return normalized
+        fallback = cls._normalize_rating(fallback_rating)
+        if fallback is not None:
+            return fallback
+        return None
+
+    @classmethod
     def _strip_rating_overview(cls, overview: Optional[str]) -> str:
         lines = [line.strip() for line in str(overview or "").splitlines() if line.strip()]
         while lines and lines[0].startswith(cls._OVERVIEW_PREFIXES):
@@ -2310,7 +2446,7 @@ class MultiRatingsRecommend(_PluginBase):
         return "\n".join(lines).strip()
 
     @classmethod
-    def _merge_rating_tagline(cls, ratings: List[Tuple[str, float]], tagline: Optional[str]) -> str:
+    def _merge_rating_tagline(cls, ratings: List[Tuple[str, float]]) -> str:
         rating_line = " / ".join(f"{label} {value:.1f}" for label, value in ratings)
         return rating_line
 

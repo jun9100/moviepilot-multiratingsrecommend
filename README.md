@@ -33,7 +33,7 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
 2. 安装插件 `MultiRatingsRecommend`。
 3. 在插件配置页启用插件，并按需填写 `OMDb API Key` 或 IMDb 官方数据集路径。
 
-> 当前文档对应版本：`v0.6.17`
+> 当前文档对应版本：`v0.6.18`
 >
 > 评分链路排障文档：`docs/RATING_LOGIC_MAP.md`
 
@@ -78,6 +78,7 @@ TMDB 7.2 / 豆瓣 6.4 / IMDb 8.8
   - `GET /api/v1/plugin/MultiRatingsRecommend/imdb/status`
   - `POST /api/v1/plugin/MultiRatingsRecommend/imdb/rebuild`
 - 新增插件工作流动作：`过滤媒体关键词`（通过“调用插件”动作使用），可在 `context.medias` 上按 `include/exclude` 正则过滤，适合在“添加订阅”前拦截 LGBT/杜比等关键词。
+- 修复 `workflow/plugin/actions` 查询时的动作序列化兼容问题，“调用插件”节点可在界面稳定加载并选择该动作。
 - OMDb 限额熔断状态会持久化保存，容器重启后不会马上重新打满额度。
 - 豆瓣匹配不再只用单一标题，会同时尝试中文名、原标题、英文名和别名。
 

@@ -22,28 +22,11 @@ from app.schemas.types import MediaType
 from app.utils.http import AsyncRequestUtils
 
 
-class _WorkflowActionCallable:
-    """
-    可调用且可被 workflow/plugin/actions 接口安全序列化的包装器。
-    FastAPI 在编码未知对象时会尝试 dict(obj)，这里通过 __iter__ 返回空映射，
-    避免把函数对象本身写入 JSON（否则会触发 500）。
-    """
-
-    def __init__(self, fn):
-        self._fn = fn
-
-    def __call__(self, context: Any, **kwargs):
-        return self._fn(context, **kwargs)
-
-    def __iter__(self):
-        return iter(())
-
-
 class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / TMDB 的低分，缺失时依次回退 IMDb、Bangumi。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.17"
+    plugin_version = "0.6.18"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -342,14 +325,35 @@ class MultiRatingsRecommend(_PluginBase):
     def get_actions(self) -> List[Dict[str, Any]]:
         if not self.get_state():
             return []
+        # workflow/plugin/actions 接口会把动作对象直接 JSON 编码；
+        # 其中 func 是可调用对象，不能原样返回给接口，否则前端下拉可能 500。
+        api_safe = self._is_plugin_actions_api_call()
+        action = {
+            "id": "filter_medias_keywords",
+            "action_id": "filter_medias_keywords",
+            "name": "过滤媒体关键词",
+        }
+        if not api_safe:
+            action["func"] = MultiRatingsRecommend.action_filter_medias_keywords
         return [
-            {
-                "id": "filter_medias_keywords",
-                "action_id": "filter_medias_keywords",
-                "name": "过滤媒体关键词",
-                "func": _WorkflowActionCallable(MultiRatingsRecommend.action_filter_medias_keywords),
-            }
+            action
         ]
+
+    @staticmethod
+    def _is_plugin_actions_api_call() -> bool:
+        """
+        区分调用场景：
+        - API 列表查询：不返回 func（可序列化）
+        - 工作流执行：返回 func（可调用）
+        """
+        try:
+            for frame in inspect.stack(context=0):
+                filename = (frame.filename or "").replace("\\", "/")
+                if filename.endswith("/app/api/endpoints/workflow.py") and frame.function == "list_plugin_actions":
+                    return True
+        except Exception:
+            return False
+        return False
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
         return [

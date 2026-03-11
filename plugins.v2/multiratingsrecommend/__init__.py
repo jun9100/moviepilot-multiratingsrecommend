@@ -27,7 +27,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / TMDB 的低分，缺失时依次回退 IMDb、Bangumi。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.20"
+    plugin_version = "0.6.21"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -169,7 +169,7 @@ class MultiRatingsRecommend(_PluginBase):
         self._list_cache_ttl_seconds = 900
         self._prewarm_list_cache_on_startup = True
         self._prewarm_list_methods_limit = 12
-        self._workflow_auto_filter_enable = True
+        self._workflow_auto_filter_enable = False
         self._workflow_auto_exclude = self._WORKFLOW_AUTO_EXCLUDE_DEFAULT
         self._workflow_auto_min_vote_count = 100
         self._workflow_auto_min_days_since_release = 14
@@ -227,7 +227,7 @@ class MultiRatingsRecommend(_PluginBase):
             "list_cache_ttl_seconds": 900,
             "prewarm_list_cache_on_startup": True,
             "prewarm_list_methods_limit": 12,
-            "workflow_auto_filter_enable": True,
+            "workflow_auto_filter_enable": False,
             "workflow_auto_exclude": MultiRatingsRecommend._WORKFLOW_AUTO_EXCLUDE_DEFAULT,
             "workflow_auto_min_vote_count": 100,
             "workflow_auto_min_days_since_release": 14,
@@ -359,7 +359,7 @@ class MultiRatingsRecommend(_PluginBase):
             "name": "过滤媒体关键词",
         }
         if not api_safe:
-            action["func"] = MultiRatingsRecommend.action_filter_medias_keywords
+            action["func"] = self.action_filter_medias_keywords
         return [
             action
         ]
@@ -623,7 +623,7 @@ class MultiRatingsRecommend(_PluginBase):
                 "component": "VSwitch",
                 "props": {
                     "model": "workflow_auto_filter_enable",
-                    "label": "工作流自动过滤（无需调用插件节点）",
+                    "label": "工作流自动过滤兜底（仅旧版前端无调用插件节点时开启）",
                     "class": "mb-2",
                     "disabled": "{{ !enable }}",
                 },
@@ -632,33 +632,33 @@ class MultiRatingsRecommend(_PluginBase):
                 "component": "VTextField",
                 "props": {
                     "model": "workflow_auto_exclude",
-                    "label": "工作流自动过滤排除关键词（正则）",
+                    "label": "工作流过滤默认排除关键词（调用插件节点留空时使用）",
                     "placeholder": "例如：同性|LGBT|杜比|Dolby\\s*Vision|HDR10\\+",
                     "clearable": True,
                     "class": "mb-2",
-                    "disabled": "{{ !enable || !workflow_auto_filter_enable }}",
+                    "disabled": "{{ !enable }}",
                 },
             },
             {
                 "component": "VTextField",
                 "props": {
                     "model": "workflow_auto_min_vote_count",
-                    "label": "工作流评分稳定闸门：最低投票人数",
+                    "label": "工作流评分稳定闸门默认值：最低投票人数",
                     "type": "number",
                     "min": 0,
                     "class": "mb-2",
-                    "disabled": "{{ !enable || !workflow_auto_filter_enable }}",
+                    "disabled": "{{ !enable }}",
                 },
             },
             {
                 "component": "VTextField",
                 "props": {
                     "model": "workflow_auto_min_days_since_release",
-                    "label": "工作流评分稳定闸门：上映最短天数",
+                    "label": "工作流评分稳定闸门默认值：上映最短天数",
                     "type": "number",
                     "min": 0,
                     "class": "mb-2",
-                    "disabled": "{{ !enable || !workflow_auto_filter_enable }}",
+                    "disabled": "{{ !enable }}",
                 },
             },
         ], self._default_config()
@@ -723,13 +723,13 @@ class MultiRatingsRecommend(_PluginBase):
             )
         return page
 
-    @staticmethod
     def action_filter_medias_keywords(
+        self,
         context: Any,
         include: Optional[str] = None,
         exclude: Optional[str] = None,
-        min_vote_count: Optional[int] = 0,
-        min_days_since_release: Optional[int] = 0,
+        min_vote_count: Optional[int] = None,
+        min_days_since_release: Optional[int] = None,
     ) -> Tuple[bool, Any]:
         """
         插件工作流动作：按关键词过滤 context.medias。
@@ -742,45 +742,24 @@ class MultiRatingsRecommend(_PluginBase):
         if not medias:
             return True, context
 
-        include_re = None
-        exclude_re = None
         include_pattern = str(include or "").strip()
-        exclude_pattern = str(exclude or "").strip()
-        if include_pattern:
-            try:
-                include_re = re.compile(include_pattern, re.I)
-            except re.error:
-                include_re = re.compile(re.escape(include_pattern), re.I)
-                logger.warn(f"媒体关键词过滤 include 非法正则，已降级字面匹配：{include_pattern}")
-        if exclude_pattern:
-            try:
-                exclude_re = re.compile(exclude_pattern, re.I)
-            except re.error:
-                exclude_re = re.compile(re.escape(exclude_pattern), re.I)
-                logger.warn(f"媒体关键词过滤 exclude 非法正则，已降级字面匹配：{exclude_pattern}")
+        exclude_pattern = str(exclude or "").strip() or self._workflow_auto_exclude
+        min_vote_threshold = self._parse_int(
+            min_vote_count,
+            default=self._workflow_auto_min_vote_count,
+        )
+        min_days_threshold = self._parse_int(
+            min_days_since_release,
+            default=self._workflow_auto_min_days_since_release,
+        )
 
-        min_vote_threshold = MultiRatingsRecommend._parse_int(min_vote_count, default=0)
-        min_days_threshold = MultiRatingsRecommend._parse_int(min_days_since_release, default=0)
-        enable_stability_guard = min_vote_threshold > 0 and min_days_threshold > 0
-
-        kept: List[Any] = []
-        blocked_keyword = 0
-        blocked_unstable = 0
-        for media in medias:
-            searchable = MultiRatingsRecommend._build_media_keyword_text(media)
-            if include_re and not include_re.search(searchable):
-                continue
-            if exclude_re and exclude_re.search(searchable):
-                blocked_keyword += 1
-                continue
-            if enable_stability_guard and MultiRatingsRecommend._is_unstable_media_rating(
-                media,
-                min_vote_count=min_vote_threshold,
-                min_days_since_release=min_days_threshold,
-            ):
-                blocked_unstable += 1
-                continue
-            kept.append(media)
+        kept, blocked_keyword, blocked_unstable = self._filter_media_list(
+            medias,
+            include=include_pattern,
+            exclude=exclude_pattern,
+            min_vote_count=min_vote_threshold,
+            min_days_since_release=min_days_threshold,
+        )
 
         context.medias = kept
         guard_text = (

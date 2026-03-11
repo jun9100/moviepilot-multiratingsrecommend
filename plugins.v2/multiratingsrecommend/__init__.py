@@ -27,7 +27,7 @@ class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / TMDB 的低分，缺失时依次回退 IMDb、Bangumi。"
     plugin_icon = "mdi-shield-half-full"
-    plugin_version = "0.6.22"
+    plugin_version = "0.6.23"
     plugin_author = "jun9100"
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
@@ -2650,12 +2650,14 @@ class MultiRatingsRecommend(_PluginBase):
         min_days_since_release: int,
     ) -> bool:
         vote_count = cls._parse_int(getattr(media, "vote_count", 0), default=0)
-        if vote_count >= min_vote_count:
-            return False
         days_since_release = cls._media_days_since_release(media)
-        if days_since_release is None:
-            return False
-        return days_since_release < min_days_since_release
+        vote_ok = True if min_vote_count <= 0 else vote_count > min_vote_count
+        days_ok = True
+        if min_days_since_release > 0:
+            # 无上映日期时不启用天数门槛，仅使用投票人数门槛
+            days_ok = True if days_since_release is None else days_since_release > min_days_since_release
+        # 只有两个门槛同时满足才放行，任一不满足都视为不稳定评分
+        return not (vote_ok and days_ok)
 
     @classmethod
     def _select_primary_rating(cls, ratings: Dict[str, float]) -> Optional[float]:

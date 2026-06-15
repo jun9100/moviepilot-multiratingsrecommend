@@ -7,9 +7,11 @@ import re
 import sqlite3
 import sys
 import time
+from collections import deque
 from concurrent.futures import Future as ConcurrentFuture
 from contextvars import ContextVar
 from datetime import date, datetime
+from itertools import islice
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any, Awaitable, Dict, List, Optional, Sequence, Tuple
@@ -325,7 +327,7 @@ class MultiRatingsRecommend(_PluginBase):
         self._imdb_dataset_build_thread: Optional[Thread] = None
         self._imdb_dataset_build_error = ""
         self._external_douban_status = "未启用"
-        self._diagnostic_records: List[Dict[str, Any]] = []
+        self._diagnostic_records: deque = deque(maxlen=self._DIAGNOSTIC_KEEP)
 
     @staticmethod
     def _default_config() -> Dict[str, Any]:
@@ -2590,15 +2592,14 @@ class MultiRatingsRecommend(_PluginBase):
             "primary": f"{primary_rating:.1f}" if primary_rating is not None else "-",
             "notes": "；".join(note for note in notes if note),
         }
-        self._diagnostic_records.insert(0, record)
-        del self._diagnostic_records[self._DIAGNOSTIC_KEEP:]
+        self._diagnostic_records.appendleft(record)
 
     def _diagnostic_summary_text(self) -> str:
         if not self._diagnostic_records:
             return "诊断记录：暂无数据。"
         lines = [
             f"{item['time']} {item['title']} | 主评分 {item['primary']} | {item['ratings']} | {item['notes']}"
-            for item in self._diagnostic_records[:8]
+            for item in islice(self._diagnostic_records, 8)
         ]
         return "最近诊断： " + " || ".join(lines)
 

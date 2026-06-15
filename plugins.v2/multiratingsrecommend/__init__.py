@@ -2174,10 +2174,7 @@ class MultiRatingsRecommend(_PluginBase):
                 source = ""
                 if isinstance(raw_value, dict):
                     rating = self._normalize_rating(raw_value.get("rating"))
-                    try:
-                        updated_at = int(raw_value.get("updated_at") or 0)
-                    except (TypeError, ValueError):
-                        updated_at = 0
+                    updated_at = self._parse_int(raw_value.get("updated_at"), default=0)
                     source = str(raw_value.get("source") or "")
                 else:
                     rating = self._normalize_rating(raw_value)
@@ -2195,10 +2192,7 @@ class MultiRatingsRecommend(_PluginBase):
         data = self.get_data(self._DOUBAN_WEB_QUOTA_KEY) or {}
         if isinstance(data, dict):
             self._douban_web_quota_date = str(data.get("date") or "")
-            try:
-                self._douban_web_quota_count = max(0, int(data.get("count") or 0))
-            except (TypeError, ValueError):
-                self._douban_web_quota_count = 0
+            self._douban_web_quota_count = max(0, self._parse_int(data.get("count"), default=0))
         else:
             self._douban_web_quota_date = ""
             self._douban_web_quota_count = 0
@@ -2212,10 +2206,7 @@ class MultiRatingsRecommend(_PluginBase):
                 douban_id = str(raw_id or "").strip()
                 if not douban_id:
                     continue
-                try:
-                    ts = int(raw_ts or 0)
-                except (TypeError, ValueError):
-                    ts = 0
+                ts = self._parse_int(raw_ts, default=0)
                 if ts > 0:
                     state[douban_id] = ts
         self._douban_web_miss_state = state
@@ -2231,10 +2222,7 @@ class MultiRatingsRecommend(_PluginBase):
         )
 
     def _save_douban_web_miss_state(self):
-        if not self._douban_web_miss_state:
-            self.del_data(self._DOUBAN_WEB_MISS_STATE_KEY)
-            return
-        self.save_data(self._DOUBAN_WEB_MISS_STATE_KEY, self._douban_web_miss_state)
+        self._save_or_del(self._DOUBAN_WEB_MISS_STATE_KEY, self._douban_web_miss_state)
 
     @staticmethod
     def _today_str() -> str:
@@ -2303,10 +2291,18 @@ class MultiRatingsRecommend(_PluginBase):
             self._save_douban_web_miss_state()
 
     def _save_douban_rating_store(self):
-        if not self._douban_rating_store:
-            self.del_data(self._DOUBAN_RATING_STORE_KEY)
+        self._save_or_del(self._DOUBAN_RATING_STORE_KEY, self._douban_rating_store)
+
+    def _save_or_del(self, key: str, payload: Any) -> None:
+        """Persist `payload` under `key`, or delete the key when payload is empty.
+
+        Empties write would leave a useless `{}` blob in storage; deleting keeps
+        the on-disk state minimal.
+        """
+        if not payload:
+            self.del_data(key)
             return
-        self.save_data(self._DOUBAN_RATING_STORE_KEY, self._douban_rating_store)
+        self.save_data(key, payload)
 
     def _remember_douban_rating(self, douban_id: str, rating: Any, source: str = ""):
         normalized_rating = self._normalize_rating(rating)

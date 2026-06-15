@@ -315,7 +315,7 @@ class MultiRatingsRecommend(_PluginBase):
         self._douban_web_quota_count: int = 0
         self._douban_web_miss_state: Dict[str, int] = {}
         self._list_cache_lock = Lock()
-        self._list_result_cache: Dict[str, Dict[str, Any]] = {}
+        self._list_result_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._list_prewarm_thread: Optional[Thread] = None
         self._list_prewarm_running = False
         self._imdb_blocked_until: float = 0
@@ -975,33 +975,58 @@ class MultiRatingsRecommend(_PluginBase):
         self._diagnostic_records.clear()
 
     @staticmethod
-    def _normalize_cache_scalar(value: Any) -> Any:
-        if isinstance(value, (str, int, float, bool)) or value is None:
+    def _freeze(value: Any) -> Any:
+        """Convert an arbitrary value into a hashable, equality-stable form.
+
+        Previously the cache key was built by deep-normalizing args/kwargs and
+        then `json.dumps(sort_keys=True)`-ing the result. JSON encoding +
+        recursive dict comprehension fired on every list dispatch — both hits
+        and misses. _freeze returns native hashable structures (tuples) that
+        can be used directly as dict keys.
+
+        Invariants preserved from the old normalizer:
+        - MediaType -> its .value
+        - dict -> tuple of (str(key), frozen(value)) pairs sorted by str(key)
+        - list/tuple -> tuple of frozen items
+        - scalars (str/int/float/bool/None) -> as-is
+        - anything else -> str(value)
+        """
+        if value is None or isinstance(value, (str, int, float, bool)):
             return value
         if isinstance(value, MediaType):
             return value.value
-        if isinstance(value, (list, tuple)):
-            return tuple(MultiRatingsRecommend._normalize_cache_scalar(item) for item in value)
         if isinstance(value, dict):
-            return {
-                str(key): MultiRatingsRecommend._normalize_cache_scalar(item)
-                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-            }
+            return tuple(
+                (str(k), MultiRatingsRecommend._freeze(v))
+                for k, v in sorted(value.items(), key=lambda pair: str(pair[0]))
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(MultiRatingsRecommend._freeze(item) for item in value)
         return str(value)
 
-    def _build_list_cache_key(self, method: str, args: Sequence[Any], kwargs: Dict[str, Any]) -> str:
-        normalized_kwargs = dict(kwargs or {})
-        if "page" not in normalized_kwargs:
-            normalized_kwargs["page"] = 1
-        payload = {
-            "method": method,
-            "args": [self._normalize_cache_scalar(item) for item in (args or [])],
-            "kwargs": {
-                str(key): self._normalize_cache_scalar(value)
-                for key, value in sorted(normalized_kwargs.items(), key=lambda pair: str(pair[0]))
-            },
-        }
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    def _build_list_cache_key(
+        self, method: str, args: Sequence[Any], kwargs: Dict[str, Any]
+    ) -> Tuple[Any, ...]:
+        # Default page=1 so paged and unpaged callers share a cache entry,
+        # matching the previous JSON-key behavior.
+        page = kwargs.get("page", 1) if kwargs else 1
+        rest = (
+            tuple(
+                (str(k), self._freeze(v))
+                for k, v in sorted(
+                    ((k, v) for k, v in (kwargs or {}).items() if k != "page"),
+                    key=lambda pair: str(pair[0]),
+                )
+            )
+            if kwargs
+            else ()
+        )
+        return (
+            method,
+            tuple(self._freeze(item) for item in (args or ())),
+            ("page", self._freeze(page)),
+            rest,
+        )
 
     @staticmethod
     def _serialize_media_items(items: Sequence[MediaInfo]) -> List[dict]:
@@ -1026,7 +1051,7 @@ class MultiRatingsRecommend(_PluginBase):
         with self._list_cache_lock:
             self._list_result_cache.clear()
 
-    def _get_list_result_cache(self, cache_key: str) -> Optional[Tuple[MediaInfo, ...]]:
+    def _get_list_result_cache(self, cache_key: Tuple[Any, ...]) -> Optional[Tuple[MediaInfo, ...]]:
         if not self._enable_list_result_cache:
             return None
         now = time.time()
@@ -1041,7 +1066,7 @@ class MultiRatingsRecommend(_PluginBase):
             payload = entry.get("items") or []
         return self._deserialize_media_items(payload)
 
-    def _set_list_result_cache(self, cache_key: str, items: Sequence[MediaInfo]):
+    def _set_list_result_cache(self, cache_key: Tuple[Any, ...], items: Sequence[MediaInfo]):
         if not self._enable_list_result_cache:
             return
         payload = self._serialize_media_items(items)

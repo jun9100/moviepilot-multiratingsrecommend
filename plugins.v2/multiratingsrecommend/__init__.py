@@ -372,6 +372,8 @@ class MultiRatingsRecommend(_PluginBase):
         self._enable_douban_web_fallback = bool(conf.get("enable_douban_web_fallback", True))
         self._douban_web_fallback_detail_only = bool(conf.get("douban_web_fallback_detail_only", True))
         try:
+            # Note: keep inline; `or 0` here means "0 disables the daily limit",
+            # which differs from the `or default` semantics of _read_clamped.
             self._douban_web_daily_limit = max(0, int(conf.get("douban_web_daily_limit", 100) or 0))
         except (TypeError, ValueError):
             self._douban_web_daily_limit = 100
@@ -379,28 +381,28 @@ class MultiRatingsRecommend(_PluginBase):
         self._imdb_source = str(conf.get("imdb_source") or "auto").strip().lower()
         self._imdb_ratings_path = str(conf.get("imdb_ratings_path") or "").strip()
         self._omdb_api_key = (conf.get("omdb_api_key") or "").strip()
-        try:
-            self._max_items = max(1, min(int(conf.get("max_items") or 30), 50))
-        except (TypeError, ValueError):
-            self._max_items = 30
-        try:
-            self._list_enrich_timeout = max(1.0, min(float(conf.get("list_enrich_timeout") or 6), 20.0))
-        except (TypeError, ValueError):
-            self._list_enrich_timeout = 6.0
-        try:
-            self._item_enrich_timeout = max(1.0, min(float(conf.get("item_enrich_timeout") or 8), 30.0))
-        except (TypeError, ValueError):
-            self._item_enrich_timeout = 8.0
+        self._max_items = self._read_clamped(
+            conf, "max_items", default=30, lo=1, hi=50, cast=int
+        )
+        self._list_enrich_timeout = self._read_clamped(
+            conf, "list_enrich_timeout", default=6.0, lo=1.0, hi=20.0, cast=float
+        )
+        self._item_enrich_timeout = self._read_clamped(
+            conf, "item_enrich_timeout", default=8.0, lo=1.0, hi=30.0, cast=float
+        )
         self._enable_list_result_cache = bool(conf.get("enable_list_result_cache", True))
-        try:
-            self._list_cache_ttl_seconds = max(60, min(int(conf.get("list_cache_ttl_seconds") or 900), 24 * 3600))
-        except (TypeError, ValueError):
-            self._list_cache_ttl_seconds = 900
+        self._list_cache_ttl_seconds = self._read_clamped(
+            conf, "list_cache_ttl_seconds", default=900, lo=60, hi=24 * 3600, cast=int
+        )
         self._prewarm_list_cache_on_startup = bool(conf.get("prewarm_list_cache_on_startup", True))
-        try:
-            self._prewarm_list_methods_limit = max(1, min(int(conf.get("prewarm_list_methods_limit") or 12), len(self._PREWARM_LIST_METHODS)))
-        except (TypeError, ValueError):
-            self._prewarm_list_methods_limit = 12
+        self._prewarm_list_methods_limit = self._read_clamped(
+            conf,
+            "prewarm_list_methods_limit",
+            default=12,
+            lo=1,
+            hi=len(self._PREWARM_LIST_METHODS),
+            cast=int,
+        )
         self._workflow_auto_filter_enable = bool(conf.get("workflow_auto_filter_enable", True))
         self._workflow_auto_exclude = str(
             conf.get("workflow_auto_exclude") or self._WORKFLOW_AUTO_EXCLUDE_DEFAULT
@@ -424,6 +426,22 @@ class MultiRatingsRecommend(_PluginBase):
         self._trigger_recommend_cache_clear()
         self._schedule_list_cache_prewarm()
         _install_fetch_medias_marker()
+
+    @staticmethod
+    def _read_clamped(conf: Dict[str, Any], key: str, *, default, lo, hi, cast):
+        """Read conf[key], cast/clamp it, fall back to default on bad input.
+
+        Preserves the historic `value or default` semantics: falsy values
+        (None, "", 0) round-trip to the default. `hi=None` skips the upper bound.
+        """
+        try:
+            value = cast(conf.get(key) or default)
+        except (TypeError, ValueError):
+            return default
+        value = max(lo, value)
+        if hi is not None:
+            value = min(value, hi)
+        return value
 
     def get_state(self) -> bool:
         return self._enabled

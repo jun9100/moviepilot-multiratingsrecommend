@@ -1095,7 +1095,7 @@ class MultiRatingsRecommend(_PluginBase):
         try:
             return self._run_async(
                 asyncio.wait_for(
-                    self._enrich_media(self._clone_media(media), enrich_context="item"),
+                    self._enrich_media(media, enrich_context="item"),
                     timeout=self._item_enrich_timeout,
                 )
             )
@@ -1116,7 +1116,7 @@ class MultiRatingsRecommend(_PluginBase):
         original = self._clone_media(media)
         try:
             return await asyncio.wait_for(
-                self._enrich_media(self._clone_media(media), enrich_context="item"),
+                self._enrich_media(media, enrich_context="item"),
                 timeout=self._item_enrich_timeout,
             )
         except asyncio.TimeoutError:

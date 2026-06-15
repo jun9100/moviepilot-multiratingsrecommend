@@ -1,11 +1,14 @@
 import asyncio
+import functools
 import gzip
 import inspect
 import json
 import re
 import sqlite3
+import sys
 import time
 from concurrent.futures import Future as ConcurrentFuture
+from contextvars import ContextVar
 from datetime import date, datetime
 from pathlib import Path
 from threading import Lock, Thread
@@ -92,6 +95,53 @@ from app.modules.themoviedb.tmdbapi import TmdbApi
 from app.plugins import _PluginBase
 from app.schemas.types import MediaType
 from app.utils.http import AsyncRequestUtils
+
+
+_WORKFLOW_FETCH_ACTIVE: ContextVar[bool] = ContextVar(
+    "mrr_workflow_fetch_active", default=False
+)
+_FETCH_MEDIAS_WRAPPED = False
+_FETCH_MEDIAS_WRAP_LOCK = Lock()
+
+
+def _install_fetch_medias_marker() -> None:
+    """Wrap FetchMediasAction.execute once so it flips a ContextVar while
+    running. Cheap, deterministic, and correct under nested calls — replaces
+    the previous inspect.stack() walk that cost ~50µs per list call.
+    """
+    global _FETCH_MEDIAS_WRAPPED
+    if _FETCH_MEDIAS_WRAPPED:
+        return
+    with _FETCH_MEDIAS_WRAP_LOCK:
+        if _FETCH_MEDIAS_WRAPPED:
+            return
+        try:
+            from app.workflow.actions.fetch_medias import FetchMediasAction  # type: ignore
+        except Exception:
+            return
+        original = getattr(FetchMediasAction, "execute", None)
+        if original is None or getattr(original, "_mrr_wrapped", False):
+            _FETCH_MEDIAS_WRAPPED = True
+            return
+        if inspect.iscoroutinefunction(original):
+            @functools.wraps(original)
+            async def execute(self, *args, **kwargs):
+                token = _WORKFLOW_FETCH_ACTIVE.set(True)
+                try:
+                    return await original(self, *args, **kwargs)
+                finally:
+                    _WORKFLOW_FETCH_ACTIVE.reset(token)
+        else:
+            @functools.wraps(original)
+            def execute(self, *args, **kwargs):  # type: ignore[misc]
+                token = _WORKFLOW_FETCH_ACTIVE.set(True)
+                try:
+                    return original(self, *args, **kwargs)
+                finally:
+                    _WORKFLOW_FETCH_ACTIVE.reset(token)
+        execute._mrr_wrapped = True  # type: ignore[attr-defined]
+        FetchMediasAction.execute = execute  # type: ignore[assignment]
+        _FETCH_MEDIAS_WRAPPED = True
 
 
 class MultiRatingsRecommend(_PluginBase):
@@ -373,6 +423,7 @@ class MultiRatingsRecommend(_PluginBase):
         self._schedule_imdb_dataset_index_build()
         self._trigger_recommend_cache_clear()
         self._schedule_list_cache_prewarm()
+        _install_fetch_medias_marker()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -445,12 +496,18 @@ class MultiRatingsRecommend(_PluginBase):
         - 工作流执行：返回 func（可调用）
         """
         try:
-            for frame in inspect.stack(context=0):
-                filename = (frame.filename or "").replace("\\", "/")
-                if filename.endswith("/app/api/endpoints/workflow.py") and frame.function == "list_plugin_actions":
-                    return True
-        except Exception:
+            frame = sys._getframe(1)
+        except (ValueError, AttributeError):
             return False
+        for _ in range(16):
+            if frame is None:
+                return False
+            code = frame.f_code
+            if code.co_name == "list_plugin_actions":
+                filename = (code.co_filename or "").replace("\\", "/")
+                if filename.endswith("/app/api/endpoints/workflow.py"):
+                    return True
+            frame = frame.f_back
         return False
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
@@ -2653,13 +2710,27 @@ class MultiRatingsRecommend(_PluginBase):
 
     @staticmethod
     def _is_workflow_fetch_call() -> bool:
-        try:
-            for frame in inspect.stack(context=0):
-                filename = (frame.filename or "").replace("\\", "/")
-                if filename.endswith("/app/workflow/actions/fetch_medias.py") and frame.function == "execute":
-                    return True
-        except Exception:
+        # Primary path: ContextVar set by our wrapper on FetchMediasAction.execute.
+        if _WORKFLOW_FETCH_ACTIVE.get():
+            return True
+        # Fallback: if the wrapper failed to install (e.g. MP internal refactor),
+        # do a shallow sys._getframe walk capped at small depth. Far cheaper
+        # than inspect.stack() because we don't materialize FrameInfo objects.
+        if _FETCH_MEDIAS_WRAPPED:
             return False
+        try:
+            frame = sys._getframe(1)
+        except (ValueError, AttributeError):
+            return False
+        for _ in range(12):
+            if frame is None:
+                return False
+            code = frame.f_code
+            if code.co_name == "execute":
+                filename = (code.co_filename or "").replace("\\", "/")
+                if filename.endswith("/app/workflow/actions/fetch_medias.py"):
+                    return True
+            frame = frame.f_back
         return False
 
     def _apply_workflow_auto_filter(self, medias: Any, method: str, from_cache: bool) -> Any:

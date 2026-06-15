@@ -3005,38 +3005,13 @@ class MultiRatingsRecommend(_PluginBase):
         loop.create_task(self._clear_recommend_cache())
 
     async def _clear_recommend_cache(self):
-        method_names = (
-            "tmdb_movies",
-            "tmdb_tvs",
-            "tmdb_trending",
-            "douban_movie_showing",
-            "douban_movies",
-            "douban_tvs",
-            "douban_movie_top250",
-            "douban_tv_weekly_chinese",
-            "douban_tv_weekly_global",
-            "douban_tv_animation",
-            "douban_movie_hot",
-            "douban_tv_hot",
-            "bangumi_calendar",
-            "async_tmdb_movies",
-            "async_tmdb_tvs",
-            "async_tmdb_trending",
-            "async_douban_movie_showing",
-            "async_douban_movies",
-            "async_douban_tvs",
-            "async_douban_movie_top250",
-            "async_douban_tv_weekly_chinese",
-            "async_douban_tv_weekly_global",
-            "async_douban_tv_animation",
-            "async_douban_movie_hot",
-            "async_douban_tv_hot",
-            "async_bangumi_calendar",
-        )
+        # Discover everything on RecommendChain that carries a .cache_clear
+        # attribute (the @cached / @async_cached decorators attach one). This
+        # used to be a hardcoded 26-entry list that silently dropped any new
+        # MP recommend source.
         try:
-            for method_name in method_names:
-                method = getattr(RecommendChain, method_name, None)
-                clear_fn = getattr(method, "cache_clear", None)
+            for _name, member in inspect.getmembers(RecommendChain):
+                clear_fn = getattr(member, "cache_clear", None)
                 if not clear_fn:
                     continue
                 if inspect.iscoroutinefunction(clear_fn):

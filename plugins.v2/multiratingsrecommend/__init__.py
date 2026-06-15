@@ -5,13 +5,83 @@ import json
 import re
 import sqlite3
 import time
+from concurrent.futures import Future as ConcurrentFuture
 from datetime import date, datetime
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote_plus
 
 from fastapi.concurrency import run_in_threadpool
+
+
+class _SharedAsyncRunner:
+    """A single dedicated background asyncio loop shared by all sync entry points.
+
+    Replaces the previous pattern of `asyncio.run(awaitable)` (or starting a
+    fresh thread + new loop per call), which created a brand-new event loop on
+    every invocation. That defeated TCP connection pooling, async semaphores,
+    and any per-loop state inside HTTP clients. Routing every sync call through
+    one persistent loop on one daemon thread means those resources are reused.
+    """
+
+    def __init__(self, name: str = "mp-mrr-loop"):
+        self._name = name
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[Thread] = None
+        self._lock = Lock()
+
+    def _ensure_started(self) -> asyncio.AbstractEventLoop:
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            return loop
+        with self._lock:
+            loop = self._loop
+            if loop is not None and not loop.is_closed():
+                return loop
+            loop = asyncio.new_event_loop()
+            thread = Thread(target=loop.run_forever, daemon=True, name=self._name)
+            thread.start()
+            self._loop = loop
+            self._thread = thread
+            return loop
+
+    def run(self, awaitable: Awaitable[Any]) -> Any:
+        """Submit a coroutine and block until it finishes. Raises any exception."""
+        loop = self._ensure_started()
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            raise RuntimeError(
+                "_SharedAsyncRunner.run() called from inside its own loop; "
+                "use `await` directly instead."
+            )
+        return asyncio.run_coroutine_threadsafe(awaitable, loop).result()
+
+    def submit(self, awaitable: Awaitable[Any]) -> ConcurrentFuture:
+        """Fire-and-forget on the shared loop. Returns a Future for callbacks."""
+        loop = self._ensure_started()
+        return asyncio.run_coroutine_threadsafe(awaitable, loop)
+
+    def stop(self) -> None:
+        loop = self._loop
+        thread = self._thread
+        self._loop = None
+        self._thread = None
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except RuntimeError:
+            pass
+        if thread is not None:
+            thread.join(timeout=2.0)
+        try:
+            loop.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 from app.chain.media import MediaChain
 from app.chain.recommend import RecommendChain
@@ -33,6 +103,8 @@ class MultiRatingsRecommend(_PluginBase):
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
     plugin_order = 70
+
+    _shared_runner: "_SharedAsyncRunner" = _SharedAsyncRunner()
 
     _SYNC_MEDIA_ITEM_METHODS = (
         "recognize_media",
@@ -941,7 +1013,7 @@ class MultiRatingsRecommend(_PluginBase):
 
     def _run_list_cache_prewarm(self):
         try:
-            asyncio.run(self._prewarm_list_cache())
+            self._shared_runner.run(self._prewarm_list_cache())
         except Exception as err:
             logger.warn(f"推荐分类缓存预热失败：{err}")
         finally:
@@ -2849,34 +2921,19 @@ class MultiRatingsRecommend(_PluginBase):
 
     @staticmethod
     def _run_async(awaitable):
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(awaitable)
-        result: List[Any] = []
-        errors: List[BaseException] = []
+        """Run a coroutine from a sync context using the shared background loop.
 
-        def _runner():
-            try:
-                result.append(asyncio.run(awaitable))
-            except BaseException as err:  # noqa: BLE001
-                errors.append(err)
-
-        import threading
-
-        thread = threading.Thread(target=_runner, daemon=True)
-        thread.start()
-        thread.join()
-        if errors:
-            raise errors[0]
-        return result[0] if result else None
+        If already inside an event loop, callers should `await` directly; this
+        helper is for sync entry points (recommend/search dispatch from MP).
+        """
+        return MultiRatingsRecommend._shared_runner.run(awaitable)
 
     def _trigger_recommend_cache_clear(self):
         self._clear_list_result_cache()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            asyncio.run(self._clear_recommend_cache())
+            self._shared_runner.submit(self._clear_recommend_cache())
             return
         loop.create_task(self._clear_recommend_cache())
 

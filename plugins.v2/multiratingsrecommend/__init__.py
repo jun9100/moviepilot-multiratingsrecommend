@@ -1147,44 +1147,38 @@ class MultiRatingsRecommend(_PluginBase):
         return result
 
     async def _async_call_system_method(self, method: str, *args, **kwargs):
-        result = None
-        modules = sorted(self.chain.modulemanager.get_running_modules(method), key=lambda module: module.get_priority())
-        for module in modules:
-            func = getattr(module, method, None)
-            if not func:
-                continue
-            if self._is_empty(result):
-                if inspect.iscoroutinefunction(func):
-                    result = await func(*args, **kwargs)
-                else:
-                    result = await run_in_threadpool(func, *args, **kwargs)
-            elif isinstance(result, list):
-                if inspect.iscoroutinefunction(func):
-                    temp = await func(*args, **kwargs)
-                else:
-                    temp = await run_in_threadpool(func, *args, **kwargs)
-                if isinstance(temp, list):
-                    result.extend(temp)
-            else:
-                break
-        return result
+        return await self._async_dispatch(method, args, kwargs, exclude_self=False)
 
     async def _async_call_system_method_excluding_self(self, method: str, *args, **kwargs):
-        result = None
-        modules = sorted(self.chain.modulemanager.get_running_modules(method), key=lambda module: module.get_priority())
+        return await self._async_dispatch(method, args, kwargs, exclude_self=True)
+
+    async def _async_dispatch(
+        self,
+        method: str,
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+        *,
+        exclude_self: bool,
+    ) -> Any:
+        result: Any = None
+        modules = sorted(
+            self.chain.modulemanager.get_running_modules(method),
+            key=lambda module: module.get_priority(),
+        )
         for module in modules:
-            if module is self:
+            if exclude_self and module is self:
                 continue
             func = getattr(module, method, None)
             if not func:
                 continue
+            is_coro = inspect.iscoroutinefunction(func)
             if self._is_empty(result):
-                if inspect.iscoroutinefunction(func):
+                if is_coro:
                     result = await func(*args, **kwargs)
                 else:
                     result = await run_in_threadpool(func, *args, **kwargs)
             elif isinstance(result, list):
-                if inspect.iscoroutinefunction(func):
+                if is_coro:
                     temp = await func(*args, **kwargs)
                 else:
                     temp = await run_in_threadpool(func, *args, **kwargs)

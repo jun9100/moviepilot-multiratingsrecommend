@@ -1,17 +1,92 @@
 import asyncio
+import functools
 import gzip
 import inspect
 import json
 import re
 import sqlite3
+import sys
 import time
+from collections import deque
+from concurrent.futures import Future as ConcurrentFuture
+from contextvars import ContextVar
 from datetime import date, datetime
+from itertools import islice
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote_plus
 
 from fastapi.concurrency import run_in_threadpool
+
+
+class _SharedAsyncRunner:
+    """A single dedicated background asyncio loop shared by all sync entry points.
+
+    Replaces the previous pattern of `asyncio.run(awaitable)` (or starting a
+    fresh thread + new loop per call), which created a brand-new event loop on
+    every invocation. That defeated TCP connection pooling, async semaphores,
+    and any per-loop state inside HTTP clients. Routing every sync call through
+    one persistent loop on one daemon thread means those resources are reused.
+    """
+
+    def __init__(self, name: str = "mp-mrr-loop"):
+        self._name = name
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[Thread] = None
+        self._lock = Lock()
+
+    def _ensure_started(self) -> asyncio.AbstractEventLoop:
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            return loop
+        with self._lock:
+            loop = self._loop
+            if loop is not None and not loop.is_closed():
+                return loop
+            loop = asyncio.new_event_loop()
+            thread = Thread(target=loop.run_forever, daemon=True, name=self._name)
+            thread.start()
+            self._loop = loop
+            self._thread = thread
+            return loop
+
+    def run(self, awaitable: Awaitable[Any]) -> Any:
+        """Submit a coroutine and block until it finishes. Raises any exception."""
+        loop = self._ensure_started()
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            raise RuntimeError(
+                "_SharedAsyncRunner.run() called from inside its own loop; "
+                "use `await` directly instead."
+            )
+        return asyncio.run_coroutine_threadsafe(awaitable, loop).result()
+
+    def submit(self, awaitable: Awaitable[Any]) -> ConcurrentFuture:
+        """Fire-and-forget on the shared loop. Returns a Future for callbacks."""
+        loop = self._ensure_started()
+        return asyncio.run_coroutine_threadsafe(awaitable, loop)
+
+    def stop(self) -> None:
+        loop = self._loop
+        thread = self._thread
+        self._loop = None
+        self._thread = None
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except RuntimeError:
+            pass
+        if thread is not None:
+            thread.join(timeout=2.0)
+        try:
+            loop.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 from app.chain.media import MediaChain
 from app.chain.recommend import RecommendChain
@@ -24,6 +99,53 @@ from app.schemas.types import MediaType
 from app.utils.http import AsyncRequestUtils
 
 
+_WORKFLOW_FETCH_ACTIVE: ContextVar[bool] = ContextVar(
+    "mrr_workflow_fetch_active", default=False
+)
+_FETCH_MEDIAS_WRAPPED = False
+_FETCH_MEDIAS_WRAP_LOCK = Lock()
+
+
+def _install_fetch_medias_marker() -> None:
+    """Wrap FetchMediasAction.execute once so it flips a ContextVar while
+    running. Cheap, deterministic, and correct under nested calls — replaces
+    the previous inspect.stack() walk that cost ~50µs per list call.
+    """
+    global _FETCH_MEDIAS_WRAPPED
+    if _FETCH_MEDIAS_WRAPPED:
+        return
+    with _FETCH_MEDIAS_WRAP_LOCK:
+        if _FETCH_MEDIAS_WRAPPED:
+            return
+        try:
+            from app.workflow.actions.fetch_medias import FetchMediasAction  # type: ignore
+        except Exception:
+            return
+        original = getattr(FetchMediasAction, "execute", None)
+        if original is None or getattr(original, "_mrr_wrapped", False):
+            _FETCH_MEDIAS_WRAPPED = True
+            return
+        if inspect.iscoroutinefunction(original):
+            @functools.wraps(original)
+            async def execute(self, *args, **kwargs):
+                token = _WORKFLOW_FETCH_ACTIVE.set(True)
+                try:
+                    return await original(self, *args, **kwargs)
+                finally:
+                    _WORKFLOW_FETCH_ACTIVE.reset(token)
+        else:
+            @functools.wraps(original)
+            def execute(self, *args, **kwargs):  # type: ignore[misc]
+                token = _WORKFLOW_FETCH_ACTIVE.set(True)
+                try:
+                    return original(self, *args, **kwargs)
+                finally:
+                    _WORKFLOW_FETCH_ACTIVE.reset(token)
+        execute._mrr_wrapped = True  # type: ignore[attr-defined]
+        FetchMediasAction.execute = execute  # type: ignore[assignment]
+        _FETCH_MEDIAS_WRAPPED = True
+
+
 class MultiRatingsRecommend(_PluginBase):
     plugin_name = "全平台低分保护"
     plugin_desc = "统一接管推荐、搜索、识别结果评分，主评分取 豆瓣 / TMDB 的低分，缺失时依次回退 IMDb、Bangumi。"
@@ -33,6 +155,8 @@ class MultiRatingsRecommend(_PluginBase):
     author_url = "https://github.com/jun9100"
     plugin_config_prefix = "multiratingsrecommend_"
     plugin_order = 70
+
+    _shared_runner: "_SharedAsyncRunner" = _SharedAsyncRunner()
 
     _SYNC_MEDIA_ITEM_METHODS = (
         "recognize_media",
@@ -203,7 +327,7 @@ class MultiRatingsRecommend(_PluginBase):
         self._imdb_dataset_build_thread: Optional[Thread] = None
         self._imdb_dataset_build_error = ""
         self._external_douban_status = "未启用"
-        self._diagnostic_records: List[Dict[str, Any]] = []
+        self._diagnostic_records: deque = deque(maxlen=self._DIAGNOSTIC_KEEP)
 
     @staticmethod
     def _default_config() -> Dict[str, Any]:
@@ -250,6 +374,8 @@ class MultiRatingsRecommend(_PluginBase):
         self._enable_douban_web_fallback = bool(conf.get("enable_douban_web_fallback", True))
         self._douban_web_fallback_detail_only = bool(conf.get("douban_web_fallback_detail_only", True))
         try:
+            # Note: keep inline; `or 0` here means "0 disables the daily limit",
+            # which differs from the `or default` semantics of _read_clamped.
             self._douban_web_daily_limit = max(0, int(conf.get("douban_web_daily_limit", 100) or 0))
         except (TypeError, ValueError):
             self._douban_web_daily_limit = 100
@@ -257,28 +383,28 @@ class MultiRatingsRecommend(_PluginBase):
         self._imdb_source = str(conf.get("imdb_source") or "auto").strip().lower()
         self._imdb_ratings_path = str(conf.get("imdb_ratings_path") or "").strip()
         self._omdb_api_key = (conf.get("omdb_api_key") or "").strip()
-        try:
-            self._max_items = max(1, min(int(conf.get("max_items") or 30), 50))
-        except (TypeError, ValueError):
-            self._max_items = 30
-        try:
-            self._list_enrich_timeout = max(1.0, min(float(conf.get("list_enrich_timeout") or 6), 20.0))
-        except (TypeError, ValueError):
-            self._list_enrich_timeout = 6.0
-        try:
-            self._item_enrich_timeout = max(1.0, min(float(conf.get("item_enrich_timeout") or 8), 30.0))
-        except (TypeError, ValueError):
-            self._item_enrich_timeout = 8.0
+        self._max_items = self._read_clamped(
+            conf, "max_items", default=30, lo=1, hi=50, cast=int
+        )
+        self._list_enrich_timeout = self._read_clamped(
+            conf, "list_enrich_timeout", default=6.0, lo=1.0, hi=20.0, cast=float
+        )
+        self._item_enrich_timeout = self._read_clamped(
+            conf, "item_enrich_timeout", default=8.0, lo=1.0, hi=30.0, cast=float
+        )
         self._enable_list_result_cache = bool(conf.get("enable_list_result_cache", True))
-        try:
-            self._list_cache_ttl_seconds = max(60, min(int(conf.get("list_cache_ttl_seconds") or 900), 24 * 3600))
-        except (TypeError, ValueError):
-            self._list_cache_ttl_seconds = 900
+        self._list_cache_ttl_seconds = self._read_clamped(
+            conf, "list_cache_ttl_seconds", default=900, lo=60, hi=24 * 3600, cast=int
+        )
         self._prewarm_list_cache_on_startup = bool(conf.get("prewarm_list_cache_on_startup", True))
-        try:
-            self._prewarm_list_methods_limit = max(1, min(int(conf.get("prewarm_list_methods_limit") or 12), len(self._PREWARM_LIST_METHODS)))
-        except (TypeError, ValueError):
-            self._prewarm_list_methods_limit = 12
+        self._prewarm_list_methods_limit = self._read_clamped(
+            conf,
+            "prewarm_list_methods_limit",
+            default=12,
+            lo=1,
+            hi=len(self._PREWARM_LIST_METHODS),
+            cast=int,
+        )
         self._workflow_auto_filter_enable = bool(conf.get("workflow_auto_filter_enable", True))
         self._workflow_auto_exclude = str(
             conf.get("workflow_auto_exclude") or self._WORKFLOW_AUTO_EXCLUDE_DEFAULT
@@ -301,6 +427,23 @@ class MultiRatingsRecommend(_PluginBase):
         self._schedule_imdb_dataset_index_build()
         self._trigger_recommend_cache_clear()
         self._schedule_list_cache_prewarm()
+        _install_fetch_medias_marker()
+
+    @staticmethod
+    def _read_clamped(conf: Dict[str, Any], key: str, *, default, lo, hi, cast):
+        """Read conf[key], cast/clamp it, fall back to default on bad input.
+
+        Preserves the historic `value or default` semantics: falsy values
+        (None, "", 0) round-trip to the default. `hi=None` skips the upper bound.
+        """
+        try:
+            value = cast(conf.get(key) or default)
+        except (TypeError, ValueError):
+            return default
+        value = max(lo, value)
+        if hi is not None:
+            value = min(value, hi)
+        return value
 
     def get_state(self) -> bool:
         return self._enabled
@@ -339,13 +482,13 @@ class MultiRatingsRecommend(_PluginBase):
             return {}
         modules: Dict[str, Any] = {}
         for method in self._SYNC_MEDIA_ITEM_METHODS:
-            modules[method] = self._make_sync_item_handler(method)
+            modules[method] = functools.partial(self._handle_sync_media_item, method)
         for method in self._ASYNC_MEDIA_ITEM_METHODS:
-            modules[method] = self._make_async_item_handler(method)
+            modules[method] = functools.partial(self._handle_async_media_item, method)
         for method in self._SYNC_MEDIA_LIST_METHODS:
-            modules[method] = self._make_sync_list_handler(method)
+            modules[method] = functools.partial(self._handle_sync_media_list, method)
         for method in self._ASYNC_MEDIA_LIST_METHODS:
-            modules[method] = self._make_async_list_handler(method)
+            modules[method] = functools.partial(self._handle_async_media_list, method)
         return modules
 
     def get_actions(self) -> List[Dict[str, Any]]:
@@ -373,12 +516,18 @@ class MultiRatingsRecommend(_PluginBase):
         - 工作流执行：返回 func（可调用）
         """
         try:
-            for frame in inspect.stack(context=0):
-                filename = (frame.filename or "").replace("\\", "/")
-                if filename.endswith("/app/api/endpoints/workflow.py") and frame.function == "list_plugin_actions":
-                    return True
-        except Exception:
+            frame = sys._getframe(1)
+        except (ValueError, AttributeError):
             return False
+        for _ in range(16):
+            if frame is None:
+                return False
+            code = frame.f_code
+            if code.co_name == "list_plugin_actions":
+                filename = (code.co_filename or "").replace("\\", "/")
+                if filename.endswith("/app/api/endpoints/workflow.py"):
+                    return True
+            frame = frame.f_back
         return False
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
@@ -825,26 +974,6 @@ class MultiRatingsRecommend(_PluginBase):
         )
         self._diagnostic_records.clear()
 
-    def _make_sync_item_handler(self, method: str):
-        def handler(*args, **kwargs):
-            return self._handle_sync_media_item(method, *args, **kwargs)
-        return handler
-
-    def _make_async_item_handler(self, method: str):
-        async def handler(*args, **kwargs):
-            return await self._handle_async_media_item(method, *args, **kwargs)
-        return handler
-
-    def _make_sync_list_handler(self, method: str):
-        def handler(*args, **kwargs):
-            return self._handle_sync_media_list(method, *args, **kwargs)
-        return handler
-
-    def _make_async_list_handler(self, method: str):
-        async def handler(*args, **kwargs):
-            return await self._handle_async_media_list(method, *args, **kwargs)
-        return handler
-
     @staticmethod
     def _normalize_cache_scalar(value: Any) -> Any:
         if isinstance(value, (str, int, float, bool)) or value is None:
@@ -941,7 +1070,7 @@ class MultiRatingsRecommend(_PluginBase):
 
     def _run_list_cache_prewarm(self):
         try:
-            asyncio.run(self._prewarm_list_cache())
+            self._shared_runner.run(self._prewarm_list_cache())
         except Exception as err:
             logger.warn(f"推荐分类缓存预热失败：{err}")
         finally:
@@ -968,7 +1097,7 @@ class MultiRatingsRecommend(_PluginBase):
         try:
             return self._run_async(
                 asyncio.wait_for(
-                    self._enrich_media(self._clone_media(media), enrich_context="item"),
+                    self._enrich_media(media, enrich_context="item"),
                     timeout=self._item_enrich_timeout,
                 )
             )
@@ -989,7 +1118,7 @@ class MultiRatingsRecommend(_PluginBase):
         original = self._clone_media(media)
         try:
             return await asyncio.wait_for(
-                self._enrich_media(self._clone_media(media), enrich_context="item"),
+                self._enrich_media(media, enrich_context="item"),
                 timeout=self._item_enrich_timeout,
             )
         except asyncio.TimeoutError:
@@ -1038,44 +1167,38 @@ class MultiRatingsRecommend(_PluginBase):
         return result
 
     async def _async_call_system_method(self, method: str, *args, **kwargs):
-        result = None
-        modules = sorted(self.chain.modulemanager.get_running_modules(method), key=lambda module: module.get_priority())
-        for module in modules:
-            func = getattr(module, method, None)
-            if not func:
-                continue
-            if self._is_empty(result):
-                if inspect.iscoroutinefunction(func):
-                    result = await func(*args, **kwargs)
-                else:
-                    result = await run_in_threadpool(func, *args, **kwargs)
-            elif isinstance(result, list):
-                if inspect.iscoroutinefunction(func):
-                    temp = await func(*args, **kwargs)
-                else:
-                    temp = await run_in_threadpool(func, *args, **kwargs)
-                if isinstance(temp, list):
-                    result.extend(temp)
-            else:
-                break
-        return result
+        return await self._async_dispatch(method, args, kwargs, exclude_self=False)
 
     async def _async_call_system_method_excluding_self(self, method: str, *args, **kwargs):
-        result = None
-        modules = sorted(self.chain.modulemanager.get_running_modules(method), key=lambda module: module.get_priority())
+        return await self._async_dispatch(method, args, kwargs, exclude_self=True)
+
+    async def _async_dispatch(
+        self,
+        method: str,
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+        *,
+        exclude_self: bool,
+    ) -> Any:
+        result: Any = None
+        modules = sorted(
+            self.chain.modulemanager.get_running_modules(method),
+            key=lambda module: module.get_priority(),
+        )
         for module in modules:
-            if module is self:
+            if exclude_self and module is self:
                 continue
             func = getattr(module, method, None)
             if not func:
                 continue
+            is_coro = inspect.iscoroutinefunction(func)
             if self._is_empty(result):
-                if inspect.iscoroutinefunction(func):
+                if is_coro:
                     result = await func(*args, **kwargs)
                 else:
                     result = await run_in_threadpool(func, *args, **kwargs)
             elif isinstance(result, list):
-                if inspect.iscoroutinefunction(func):
+                if is_coro:
                     temp = await func(*args, **kwargs)
                 else:
                     temp = await run_in_threadpool(func, *args, **kwargs)
@@ -1121,11 +1244,19 @@ class MultiRatingsRecommend(_PluginBase):
 
         ratings: Dict[str, float] = {}
         diagnostic_notes: List[str] = []
+        # When diagnostics is disabled, skip f-string formatting entirely.
+        # `note(lambda: f"...")` only invokes the lambda when we actually keep notes.
+        if self._enable_diagnostics:
+            def note(fn):
+                diagnostic_notes.append(fn() if callable(fn) else fn)
+        else:
+            def note(_fn):
+                pass
         source_label = self._source_label(media)
         current_rating = self._normalize_rating(media.vote_average)
         if source_label and current_rating is not None:
             ratings[source_label] = current_rating
-            diagnostic_notes.append(f"初始评分：{source_label} {current_rating:.1f}")
+            note(lambda: f"初始评分：{source_label} {current_rating:.1f}")
             if source_label == "豆瓣" and media.douban_id:
                 self._remember_douban_rating(str(media.douban_id), current_rating, "初始评分")
 
@@ -1134,12 +1265,12 @@ class MultiRatingsRecommend(_PluginBase):
             tmdb_rating = self._normalize_rating(tmdb_detail.get("vote_average"))
             if tmdb_rating is not None:
                 ratings["TMDB"] = tmdb_rating
-                diagnostic_notes.append(f"TMDB：{tmdb_rating:.1f}")
+                note(lambda: f"TMDB：{tmdb_rating:.1f}")
             imdb_id = self._extract_imdb_id(tmdb_detail)
             if imdb_id:
                 media.imdb_id = imdb_id
         else:
-            diagnostic_notes.append("TMDB：未补到详情")
+            note("TMDB：未补到详情")
 
         douban_info = None
         if self._enable_douban:
@@ -1154,7 +1285,7 @@ class MultiRatingsRecommend(_PluginBase):
                     timeout=douban_timeout,
                 )
             except asyncio.TimeoutError:
-                diagnostic_notes.append(f"豆瓣：解析超时（>{douban_timeout:.1f}s），跳过")
+                note(lambda: f"豆瓣：解析超时（>{douban_timeout:.1f}s），跳过")
                 douban_info = None
             if douban_info:
                 douban_id = douban_info.get("id")
@@ -1163,33 +1294,33 @@ class MultiRatingsRecommend(_PluginBase):
                 imdb_id_from_douban = self._extract_douban_imdb_id(douban_info)
                 if imdb_id_from_douban and not media.imdb_id:
                     media.imdb_id = imdb_id_from_douban
-                    diagnostic_notes.append(f"IMDb ID：来自豆瓣 {imdb_id_from_douban}")
+                    note(lambda: f"IMDb ID：来自豆瓣 {imdb_id_from_douban}")
                 douban_rating = self._extract_douban_rating(douban_info)
                 if douban_rating is not None:
                     ratings["豆瓣"] = douban_rating
-                    diagnostic_notes.append(
-                        f"豆瓣：{douban_rating:.1f}（{douban_info.get('__mr_source') or '内置'}）"
+                    note(
+                        lambda: f"豆瓣：{douban_rating:.1f}（{douban_info.get('__mr_source') or '内置'}）"
                     )
                 else:
-                    diagnostic_notes.append(
-                        f"豆瓣：已命中 {douban_info.get('__mr_source') or '内置'}，但无评分"
+                    note(
+                        lambda: f"豆瓣：已命中 {douban_info.get('__mr_source') or '内置'}，但无评分"
                     )
             else:
-                diagnostic_notes.append("豆瓣：未匹配到")
+                note("豆瓣：未匹配到")
 
         if self._enable_imdb and media.imdb_id:
             imdb_rating = await self._get_imdb_rating(media.imdb_id)
             if imdb_rating is not None:
                 ratings["IMDb"] = imdb_rating
-                diagnostic_notes.append(f"IMDb：{imdb_rating:.1f}")
+                note(lambda: f"IMDb：{imdb_rating:.1f}")
             elif self._imdb_blocked_until > time.time():
-                diagnostic_notes.append("IMDb：OMDb 限额熔断中")
+                note("IMDb：OMDb 限额熔断中")
             elif self._imdb_source in {"auto", "dataset"} and self._imdb_dataset_status in {"未配置数据集路径", "数据集路径不存在"}:
-                diagnostic_notes.append(f"IMDb：数据集不可用（{self._imdb_dataset_status}）")
+                note(lambda: f"IMDb：数据集不可用（{self._imdb_dataset_status}）")
             else:
-                diagnostic_notes.append("IMDb：未命中")
+                note("IMDb：未命中")
         elif self._enable_imdb:
-            diagnostic_notes.append("IMDb：无 imdb_id")
+            note("IMDb：无 imdb_id")
 
         bangumi_rating = self._extract_bangumi_media_rating(
             media,
@@ -1197,7 +1328,7 @@ class MultiRatingsRecommend(_PluginBase):
         )
         if bangumi_rating is not None and ratings.get("Bangumi") is None:
             ratings["Bangumi"] = bangumi_rating
-            diagnostic_notes.append(f"Bangumi：{bangumi_rating:.1f}")
+            note(lambda: f"Bangumi：{bangumi_rating:.1f}")
 
         if not ratings:
             self._record_diagnostic(media, ratings, None, diagnostic_notes)
@@ -1209,7 +1340,7 @@ class MultiRatingsRecommend(_PluginBase):
             media.vote_average = primary_rating
         media.tagline = self._merge_rating_tagline(display_ratings)
         if primary_rating is not None:
-            diagnostic_notes.append(f"主评分：{primary_rating:.1f}")
+            note(lambda: f"主评分：{primary_rating:.1f}")
         self._record_diagnostic(media, ratings, primary_rating, diagnostic_notes)
         return media
 
@@ -2053,10 +2184,7 @@ class MultiRatingsRecommend(_PluginBase):
                 source = ""
                 if isinstance(raw_value, dict):
                     rating = self._normalize_rating(raw_value.get("rating"))
-                    try:
-                        updated_at = int(raw_value.get("updated_at") or 0)
-                    except (TypeError, ValueError):
-                        updated_at = 0
+                    updated_at = self._parse_int(raw_value.get("updated_at"), default=0)
                     source = str(raw_value.get("source") or "")
                 else:
                     rating = self._normalize_rating(raw_value)
@@ -2074,10 +2202,7 @@ class MultiRatingsRecommend(_PluginBase):
         data = self.get_data(self._DOUBAN_WEB_QUOTA_KEY) or {}
         if isinstance(data, dict):
             self._douban_web_quota_date = str(data.get("date") or "")
-            try:
-                self._douban_web_quota_count = max(0, int(data.get("count") or 0))
-            except (TypeError, ValueError):
-                self._douban_web_quota_count = 0
+            self._douban_web_quota_count = max(0, self._parse_int(data.get("count"), default=0))
         else:
             self._douban_web_quota_date = ""
             self._douban_web_quota_count = 0
@@ -2091,10 +2216,7 @@ class MultiRatingsRecommend(_PluginBase):
                 douban_id = str(raw_id or "").strip()
                 if not douban_id:
                     continue
-                try:
-                    ts = int(raw_ts or 0)
-                except (TypeError, ValueError):
-                    ts = 0
+                ts = self._parse_int(raw_ts, default=0)
                 if ts > 0:
                     state[douban_id] = ts
         self._douban_web_miss_state = state
@@ -2110,10 +2232,7 @@ class MultiRatingsRecommend(_PluginBase):
         )
 
     def _save_douban_web_miss_state(self):
-        if not self._douban_web_miss_state:
-            self.del_data(self._DOUBAN_WEB_MISS_STATE_KEY)
-            return
-        self.save_data(self._DOUBAN_WEB_MISS_STATE_KEY, self._douban_web_miss_state)
+        self._save_or_del(self._DOUBAN_WEB_MISS_STATE_KEY, self._douban_web_miss_state)
 
     @staticmethod
     def _today_str() -> str:
@@ -2182,10 +2301,18 @@ class MultiRatingsRecommend(_PluginBase):
             self._save_douban_web_miss_state()
 
     def _save_douban_rating_store(self):
-        if not self._douban_rating_store:
-            self.del_data(self._DOUBAN_RATING_STORE_KEY)
+        self._save_or_del(self._DOUBAN_RATING_STORE_KEY, self._douban_rating_store)
+
+    def _save_or_del(self, key: str, payload: Any) -> None:
+        """Persist `payload` under `key`, or delete the key when payload is empty.
+
+        Empties write would leave a useless `{}` blob in storage; deleting keeps
+        the on-disk state minimal.
+        """
+        if not payload:
+            self.del_data(key)
             return
-        self.save_data(self._DOUBAN_RATING_STORE_KEY, self._douban_rating_store)
+        self.save_data(key, payload)
 
     def _remember_douban_rating(self, douban_id: str, rating: Any, source: str = ""):
         normalized_rating = self._normalize_rating(rating)
@@ -2465,15 +2592,14 @@ class MultiRatingsRecommend(_PluginBase):
             "primary": f"{primary_rating:.1f}" if primary_rating is not None else "-",
             "notes": "；".join(note for note in notes if note),
         }
-        self._diagnostic_records.insert(0, record)
-        del self._diagnostic_records[self._DIAGNOSTIC_KEEP:]
+        self._diagnostic_records.appendleft(record)
 
     def _diagnostic_summary_text(self) -> str:
         if not self._diagnostic_records:
             return "诊断记录：暂无数据。"
         lines = [
             f"{item['time']} {item['title']} | 主评分 {item['primary']} | {item['ratings']} | {item['notes']}"
-            for item in self._diagnostic_records[:8]
+            for item in islice(self._diagnostic_records, 8)
         ]
         return "最近诊断： " + " || ".join(lines)
 
@@ -2581,13 +2707,27 @@ class MultiRatingsRecommend(_PluginBase):
 
     @staticmethod
     def _is_workflow_fetch_call() -> bool:
-        try:
-            for frame in inspect.stack(context=0):
-                filename = (frame.filename or "").replace("\\", "/")
-                if filename.endswith("/app/workflow/actions/fetch_medias.py") and frame.function == "execute":
-                    return True
-        except Exception:
+        # Primary path: ContextVar set by our wrapper on FetchMediasAction.execute.
+        if _WORKFLOW_FETCH_ACTIVE.get():
+            return True
+        # Fallback: if the wrapper failed to install (e.g. MP internal refactor),
+        # do a shallow sys._getframe walk capped at small depth. Far cheaper
+        # than inspect.stack() because we don't materialize FrameInfo objects.
+        if _FETCH_MEDIAS_WRAPPED:
             return False
+        try:
+            frame = sys._getframe(1)
+        except (ValueError, AttributeError):
+            return False
+        for _ in range(12):
+            if frame is None:
+                return False
+            code = frame.f_code
+            if code.co_name == "execute":
+                filename = (code.co_filename or "").replace("\\", "/")
+                if filename.endswith("/app/workflow/actions/fetch_medias.py"):
+                    return True
+            frame = frame.f_back
         return False
 
     def _apply_workflow_auto_filter(self, medias: Any, method: str, from_cache: bool) -> Any:
@@ -2849,70 +2989,30 @@ class MultiRatingsRecommend(_PluginBase):
 
     @staticmethod
     def _run_async(awaitable):
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(awaitable)
-        result: List[Any] = []
-        errors: List[BaseException] = []
+        """Run a coroutine from a sync context using the shared background loop.
 
-        def _runner():
-            try:
-                result.append(asyncio.run(awaitable))
-            except BaseException as err:  # noqa: BLE001
-                errors.append(err)
-
-        import threading
-
-        thread = threading.Thread(target=_runner, daemon=True)
-        thread.start()
-        thread.join()
-        if errors:
-            raise errors[0]
-        return result[0] if result else None
+        If already inside an event loop, callers should `await` directly; this
+        helper is for sync entry points (recommend/search dispatch from MP).
+        """
+        return MultiRatingsRecommend._shared_runner.run(awaitable)
 
     def _trigger_recommend_cache_clear(self):
         self._clear_list_result_cache()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            asyncio.run(self._clear_recommend_cache())
+            self._shared_runner.submit(self._clear_recommend_cache())
             return
         loop.create_task(self._clear_recommend_cache())
 
     async def _clear_recommend_cache(self):
-        method_names = (
-            "tmdb_movies",
-            "tmdb_tvs",
-            "tmdb_trending",
-            "douban_movie_showing",
-            "douban_movies",
-            "douban_tvs",
-            "douban_movie_top250",
-            "douban_tv_weekly_chinese",
-            "douban_tv_weekly_global",
-            "douban_tv_animation",
-            "douban_movie_hot",
-            "douban_tv_hot",
-            "bangumi_calendar",
-            "async_tmdb_movies",
-            "async_tmdb_tvs",
-            "async_tmdb_trending",
-            "async_douban_movie_showing",
-            "async_douban_movies",
-            "async_douban_tvs",
-            "async_douban_movie_top250",
-            "async_douban_tv_weekly_chinese",
-            "async_douban_tv_weekly_global",
-            "async_douban_tv_animation",
-            "async_douban_movie_hot",
-            "async_douban_tv_hot",
-            "async_bangumi_calendar",
-        )
+        # Discover everything on RecommendChain that carries a .cache_clear
+        # attribute (the @cached / @async_cached decorators attach one). This
+        # used to be a hardcoded 26-entry list that silently dropped any new
+        # MP recommend source.
         try:
-            for method_name in method_names:
-                method = getattr(RecommendChain, method_name, None)
-                clear_fn = getattr(method, "cache_clear", None)
+            for _name, member in inspect.getmembers(RecommendChain):
+                clear_fn = getattr(member, "cache_clear", None)
                 if not clear_fn:
                     continue
                 if inspect.iscoroutinefunction(clear_fn):

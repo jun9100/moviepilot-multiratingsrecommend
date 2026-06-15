@@ -1242,11 +1242,19 @@ class MultiRatingsRecommend(_PluginBase):
 
         ratings: Dict[str, float] = {}
         diagnostic_notes: List[str] = []
+        # When diagnostics is disabled, skip f-string formatting entirely.
+        # `note(lambda: f"...")` only invokes the lambda when we actually keep notes.
+        if self._enable_diagnostics:
+            def note(fn):
+                diagnostic_notes.append(fn() if callable(fn) else fn)
+        else:
+            def note(_fn):
+                pass
         source_label = self._source_label(media)
         current_rating = self._normalize_rating(media.vote_average)
         if source_label and current_rating is not None:
             ratings[source_label] = current_rating
-            diagnostic_notes.append(f"初始评分：{source_label} {current_rating:.1f}")
+            note(lambda: f"初始评分：{source_label} {current_rating:.1f}")
             if source_label == "豆瓣" and media.douban_id:
                 self._remember_douban_rating(str(media.douban_id), current_rating, "初始评分")
 
@@ -1255,12 +1263,12 @@ class MultiRatingsRecommend(_PluginBase):
             tmdb_rating = self._normalize_rating(tmdb_detail.get("vote_average"))
             if tmdb_rating is not None:
                 ratings["TMDB"] = tmdb_rating
-                diagnostic_notes.append(f"TMDB：{tmdb_rating:.1f}")
+                note(lambda: f"TMDB：{tmdb_rating:.1f}")
             imdb_id = self._extract_imdb_id(tmdb_detail)
             if imdb_id:
                 media.imdb_id = imdb_id
         else:
-            diagnostic_notes.append("TMDB：未补到详情")
+            note("TMDB：未补到详情")
 
         douban_info = None
         if self._enable_douban:
@@ -1275,7 +1283,7 @@ class MultiRatingsRecommend(_PluginBase):
                     timeout=douban_timeout,
                 )
             except asyncio.TimeoutError:
-                diagnostic_notes.append(f"豆瓣：解析超时（>{douban_timeout:.1f}s），跳过")
+                note(lambda: f"豆瓣：解析超时（>{douban_timeout:.1f}s），跳过")
                 douban_info = None
             if douban_info:
                 douban_id = douban_info.get("id")
@@ -1284,33 +1292,33 @@ class MultiRatingsRecommend(_PluginBase):
                 imdb_id_from_douban = self._extract_douban_imdb_id(douban_info)
                 if imdb_id_from_douban and not media.imdb_id:
                     media.imdb_id = imdb_id_from_douban
-                    diagnostic_notes.append(f"IMDb ID：来自豆瓣 {imdb_id_from_douban}")
+                    note(lambda: f"IMDb ID：来自豆瓣 {imdb_id_from_douban}")
                 douban_rating = self._extract_douban_rating(douban_info)
                 if douban_rating is not None:
                     ratings["豆瓣"] = douban_rating
-                    diagnostic_notes.append(
-                        f"豆瓣：{douban_rating:.1f}（{douban_info.get('__mr_source') or '内置'}）"
+                    note(
+                        lambda: f"豆瓣：{douban_rating:.1f}（{douban_info.get('__mr_source') or '内置'}）"
                     )
                 else:
-                    diagnostic_notes.append(
-                        f"豆瓣：已命中 {douban_info.get('__mr_source') or '内置'}，但无评分"
+                    note(
+                        lambda: f"豆瓣：已命中 {douban_info.get('__mr_source') or '内置'}，但无评分"
                     )
             else:
-                diagnostic_notes.append("豆瓣：未匹配到")
+                note("豆瓣：未匹配到")
 
         if self._enable_imdb and media.imdb_id:
             imdb_rating = await self._get_imdb_rating(media.imdb_id)
             if imdb_rating is not None:
                 ratings["IMDb"] = imdb_rating
-                diagnostic_notes.append(f"IMDb：{imdb_rating:.1f}")
+                note(lambda: f"IMDb：{imdb_rating:.1f}")
             elif self._imdb_blocked_until > time.time():
-                diagnostic_notes.append("IMDb：OMDb 限额熔断中")
+                note("IMDb：OMDb 限额熔断中")
             elif self._imdb_source in {"auto", "dataset"} and self._imdb_dataset_status in {"未配置数据集路径", "数据集路径不存在"}:
-                diagnostic_notes.append(f"IMDb：数据集不可用（{self._imdb_dataset_status}）")
+                note(lambda: f"IMDb：数据集不可用（{self._imdb_dataset_status}）")
             else:
-                diagnostic_notes.append("IMDb：未命中")
+                note("IMDb：未命中")
         elif self._enable_imdb:
-            diagnostic_notes.append("IMDb：无 imdb_id")
+            note("IMDb：无 imdb_id")
 
         bangumi_rating = self._extract_bangumi_media_rating(
             media,
@@ -1318,7 +1326,7 @@ class MultiRatingsRecommend(_PluginBase):
         )
         if bangumi_rating is not None and ratings.get("Bangumi") is None:
             ratings["Bangumi"] = bangumi_rating
-            diagnostic_notes.append(f"Bangumi：{bangumi_rating:.1f}")
+            note(lambda: f"Bangumi：{bangumi_rating:.1f}")
 
         if not ratings:
             self._record_diagnostic(media, ratings, None, diagnostic_notes)
@@ -1330,7 +1338,7 @@ class MultiRatingsRecommend(_PluginBase):
             media.vote_average = primary_rating
         media.tagline = self._merge_rating_tagline(display_ratings)
         if primary_rating is not None:
-            diagnostic_notes.append(f"主评分：{primary_rating:.1f}")
+            note(lambda: f"主评分：{primary_rating:.1f}")
         self._record_diagnostic(media, ratings, primary_rating, diagnostic_notes)
         return media
 

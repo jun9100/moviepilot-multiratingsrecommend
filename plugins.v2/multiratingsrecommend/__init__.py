@@ -462,13 +462,13 @@ class MultiRatingsRecommend(_PluginBase):
             return {}
         modules: Dict[str, Any] = {}
         for method in self._SYNC_MEDIA_ITEM_METHODS:
-            modules[method] = self._make_sync_item_handler(method)
+            modules[method] = functools.partial(self._handle_sync_media_item, method)
         for method in self._ASYNC_MEDIA_ITEM_METHODS:
-            modules[method] = self._make_async_item_handler(method)
+            modules[method] = functools.partial(self._handle_async_media_item, method)
         for method in self._SYNC_MEDIA_LIST_METHODS:
-            modules[method] = self._make_sync_list_handler(method)
+            modules[method] = functools.partial(self._handle_sync_media_list, method)
         for method in self._ASYNC_MEDIA_LIST_METHODS:
-            modules[method] = self._make_async_list_handler(method)
+            modules[method] = functools.partial(self._handle_async_media_list, method)
         return modules
 
     def get_actions(self) -> List[Dict[str, Any]]:
@@ -953,26 +953,6 @@ class MultiRatingsRecommend(_PluginBase):
             "未配置" if self._enable_external_douban else "未启用"
         )
         self._diagnostic_records.clear()
-
-    def _make_sync_item_handler(self, method: str):
-        def handler(*args, **kwargs):
-            return self._handle_sync_media_item(method, *args, **kwargs)
-        return handler
-
-    def _make_async_item_handler(self, method: str):
-        async def handler(*args, **kwargs):
-            return await self._handle_async_media_item(method, *args, **kwargs)
-        return handler
-
-    def _make_sync_list_handler(self, method: str):
-        def handler(*args, **kwargs):
-            return self._handle_sync_media_list(method, *args, **kwargs)
-        return handler
-
-    def _make_async_list_handler(self, method: str):
-        async def handler(*args, **kwargs):
-            return await self._handle_async_media_list(method, *args, **kwargs)
-        return handler
 
     @staticmethod
     def _normalize_cache_scalar(value: Any) -> Any:

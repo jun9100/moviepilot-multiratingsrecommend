@@ -6,7 +6,13 @@
 - 订阅前先做关键词拦截 + 评分稳定性拦截
 - 减少豆瓣风控风险（缓存优先、网页兜底可控）
 
-> 当前文档版本：`v0.6.25`
+> V2 版本：`v0.6.25`；V3 版本：`v3.0.0`
+
+## MoviePilot V3
+
+V3 使用独立的 `plugins.v3/` 和 `package.v3.json` 实现，适配 V3 的
+`media_source/media_id` 主身份以及 `MediaChain.async_convert_media_identity` 来源转换接口。
+V2 用户继续使用 `plugins.v2/`，两代实现互不覆盖。
 
 ## 核心规则（先看这个）
 

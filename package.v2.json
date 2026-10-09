@@ -7,6 +7,7 @@
     "icon": "Moviepilot_A.png",
     "author": "jun9100",
     "level": 1,
+    "v3": false,
     "release": false,
     "history": {
       "v0.6.25": "性能与可维护性改造：共享后台 asyncio loop（修复每次同步入口起新 loop 导致连接池/限速失效），用 ContextVar + 浅栈帧替代 inspect.stack 在热路径上的开销，列表缓存 key 由 JSON 串改为元组（~2× 加速），减少详情链路一次冗余 clone，诊断信息懒计算，RecommendChain cache_clear 动态发现，诊断 ring buffer 改 deque。模板代码精简约 117 行。无行为变化。",

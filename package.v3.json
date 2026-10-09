@@ -1,0 +1,16 @@
+{
+  "MultiRatingsRecommend": {
+    "name": "全平台低分保护",
+    "description": "统一接管 MoviePilot 的推荐、搜索、识别结果评分，主评分取 豆瓣 / TMDB 的低分，缺失时依次回退 IMDb、Bangumi。",
+    "labels": "推荐,搜索,TMDB,IMDb,豆瓣,Bangumi,评分",
+    "version": "3.0.0",
+    "icon": "Moviepilot_A.png",
+    "author": "jun9100",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "release": false,
+    "history": {
+      "v3.0.0": "新增 MoviePilot V3 专用实现：适配统一媒体身份和跨来源媒体转换 API，保留推荐、搜索、详情评分补全及工作流过滤功能。"
+    }
+  }
+}
